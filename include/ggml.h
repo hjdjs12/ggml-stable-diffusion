@@ -681,7 +681,7 @@ extern "C" {
         char name[GGML_MAX_NAME];
 
         void * extra; // extra things e.g. for ggml-cuda.cu
-
+        // uint64_t offset_in_domain; // offset in the backend domain buffer
         char padding[8];
     };
 
