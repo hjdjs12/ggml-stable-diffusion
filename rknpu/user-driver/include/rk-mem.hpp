@@ -214,7 +214,7 @@ class RegCmd {
     bool is_addr_setup = false;
 };
 
-void rknpu_ioctl(uint32_t cmd, void *act, int domain_id) {
+inline void rknpu_ioctl(uint32_t cmd, void *act, int domain_id) {
     Memory::_rknpu_ioctl(cmd, act, domain_id);
 }
 #endif // PAGE_SIZE
