@@ -98,6 +98,22 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
     endif()
 
+    if (GGML_NPU)
+        message(STATUS "Using NPU backend (RK3588)")
+        
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_NPU)
+        
+        list(APPEND GGML_CPU_SOURCES
+                    ggml-cpu/ggml-cpu-matmul-npu.cpp
+                    ggml-cpu/ggml-cpu-matmul-npu.h)
+        
+        # 添加 RKNPU 用户驱动相关的头文件路径
+        target_include_directories(${GGML_CPU_NAME} PRIVATE
+            ../../rknpu/user-driver/include
+            ../../rknpu/user-driver/src
+            ../../rknpu/user-driver)
+    endif()
+
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
         list(APPEND GGML_CPU_SOURCES

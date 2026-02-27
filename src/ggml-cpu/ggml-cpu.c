@@ -544,6 +544,12 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+// NPU support
+#ifdef GGML_USE_NPU
+#include "ggml-cpu-matmul-npu.h"
+static bool g_npu_available = true;
+#endif
+
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
@@ -1229,6 +1235,17 @@ void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+#ifdef GGML_USE_NPU
+    // 尝试使用 NPU 加速
+    printf("ggml_compute_forward_mul_mat: trying to use NPU acceleration\n");
+    if (g_npu_available && params->ith == 0) {
+        if (ggml_can_use_npu(src0, src1)) {
+            ggml_compute_forward_mul_mat_npu(params, dst);
+            return;
+        }
+    }
+#endif
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

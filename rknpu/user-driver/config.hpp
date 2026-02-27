@@ -18,7 +18,6 @@
 #include <cstring>
 #include <string>
 #include <fstream>
-#include <zip.h>
 #include <sys/mman.h>
 #include <vector>
 #include <map>
@@ -31,8 +30,8 @@
 #include <sys/syscall.h>      /* 包含 SYS_xxx 定义 */
 #include <unistd.h>           /* 包含系统调用相关的宏 */
 #include <signal.h>           /* 信号处理 */
-#include "rknpu-ioctl.h"
-#include "rk-mem.hpp"
+#include "include/rknpu-ioctl.h"
+#include "include/rk-mem.hpp"
 #include "ggml.h"
 
 #define WEIGHT_SIZE (2560UL * 1024 * 1024)
@@ -158,10 +157,10 @@ public:
             throw std::runtime_error("virtual_addr is null, call mmap_domain_data first!");
         }
         struct rknpu_mem_create mem_create = {};
-        mem_create.flags = RKNPU_MEM_ALLOCATED | 
-                      RKNPU_MEM_CACHEABLE |
-                      RKNPU_MEM_NON_CONTIGUOUS |              // 允许非连续物理内存
-                      RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;    // 限制IOVA对齐（内核日志提示）
+        mem_create.flags = RKNPU_MEM_ALLOCATED ;
+        //               RKNPU_MEM_CACHEABLE |
+        //               RKNPU_MEM_NON_CONTIGUOUS |              // 允许非连续物理内存
+        //               RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;    // 限制IOVA对齐（内核日志提示）
 
         mem_create.size = DOMAIN_SIZE;  // 必须映射整个域（包括计算缓冲区）
         mem_create.usr_va = reinterpret_cast<__u64>(virtual_addr);
@@ -184,6 +183,30 @@ public:
         std::cout << "[RKMEM]: Domain " << id << " IOMMU mapping success: "
                   << "dma_addr=" << std::hex << mem_create.dma_addr << std::dec << std::endl;
         iommu_addr = (void*)mem_create.dma_addr;
+        
+        // **关键验证：IOMMU 映射后，立即验证 CPU 是否还能访问内存**
+        std::cout << "[RKMEM]: Domain " << id << " verifying CPU access AFTER IOMMU mapping..." << std::endl;
+        try {
+            for (size_t i = 0; i < tensors.size() && i < 3; i++) {
+                auto& [tensor, file_offset] = tensors[i];
+                volatile uint8_t* ptr = (volatile uint8_t*)tensor->data;
+                size_t size = ggml_nbytes(tensor);
+                
+                // 尝试读取首、中、尾三个位置
+                volatile uint8_t test1 = ptr[0];
+                volatile uint8_t test2 = ptr[size / 2];
+                volatile uint8_t test3 = ptr[size - 1];
+                (void)test1; (void)test2; (void)test3;
+                
+                std::cout << "[RKMEM]:   Tensor " << i << " @ " << std::hex << (void*)ptr << std::dec 
+                          << ", size=" << size << " - CPU access OK after IOMMU" << std::endl;
+            }
+            std::cout << "[RKMEM]: Domain " << id << " CPU can still access memory after IOMMU mapping!" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[RKMEM]: ERROR - CPU cannot access memory after IOMMU mapping: " 
+                      << e.what() << std::endl;
+            throw;
+        }
     }
 };
 
@@ -262,6 +285,11 @@ inline void register_cleanup_handler() {
 }
 
 
+// 对齐到 16 字节边界（NEON 指令要求）
+inline size_t align_to_16(size_t size) {
+    return (size + 15) & ~15;
+}
+
 inline void mmap_domain_data(Domain *domain, const std::string& path, uint64_t offset) {
     // 1. 使用普通 mmap 分配内存（使用 MAP_POPULATE 强制立即建立页表）
     domain->virtual_addr = mmap(nullptr, DOMAIN_SIZE, 
@@ -272,20 +300,39 @@ inline void mmap_domain_data(Domain *domain, const std::string& path, uint64_t o
         throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
     }
     
+    // 验证 mmap 返回的地址是否 16 字节对齐
+    if (((uintptr_t)domain->virtual_addr) % 16 != 0) {
+        munmap(domain->virtual_addr, DOMAIN_SIZE);
+        throw std::runtime_error("mmap returned unaligned address: " + 
+                                std::to_string((uintptr_t)domain->virtual_addr));
+    }
+    std::cout << "[RKMEM]: Domain " << domain->id << " mmap allocated: "
+              << "va=" << std::hex << domain->virtual_addr << std::dec
+              << ", size=" << DOMAIN_SIZE << " bytes (" 
+              << (DOMAIN_SIZE / 1024.0 / 1024.0) << " MB)" << std::endl;
+    
     // 2. **关键步骤：立即锁定并触摸所有页面，确保页表完整建立**
     if (mlock(domain->virtual_addr, DOMAIN_SIZE) != 0) {
         munmap(domain->virtual_addr, DOMAIN_SIZE);
         domain->virtual_addr = nullptr;
         throw std::runtime_error("mlock failed: " + std::string(strerror(errno)));
     }
+    std::cout << "[RKMEM]: Domain " << domain->id << " memory locked successfully" << std::endl;
     
-    // 3. 触摸所有页面（每 4KB 写入一次，确保每个页面的页表项都建立）
+    // 3. 触摸所有页面（每 256MB 打印进度）
     const size_t page_size = 4096;
+    const size_t progress_interval = 256 * 1024 * 1024;  // 256 MB
     volatile char *ptr = (volatile char*)domain->virtual_addr;
+    std::cout << "[RKMEM]: Domain " << domain->id << " touching pages..." << std::endl;
     for (size_t i = 0; i < DOMAIN_SIZE; i += page_size) {
         ptr[i] = 0;  // 触摸每个页面
+        if ((i > 0) && (i % progress_interval == 0)) {
+            std::cout << "[RKMEM]:   Touched " << (i / 1024 / 1024) << " MB" << std::endl;
+        }
     }
-    std::cout << "[RKMEM]: Touched all pages for domain " << domain->id << std::endl;
+    size_t num_pages = DOMAIN_SIZE / page_size;
+    std::cout << "[RKMEM]: Domain " << domain->id << " touched all pages (" 
+              << num_pages << " pages)" << std::endl;
     
     // 4. 打开数据文件
     int fd = open(path.c_str(), O_RDONLY);
@@ -296,46 +343,123 @@ inline void mmap_domain_data(Domain *domain, const std::string& path, uint64_t o
         throw std::runtime_error("无法打开文件: " + std::string(strerror(errno)));
     }
     
-    // 5. 定位到文件偏移
-    if (lseek(fd, offset, SEEK_SET) == -1) {
-        close(fd);
-        munlock(domain->virtual_addr, DOMAIN_SIZE);
-        munmap(domain->virtual_addr, DOMAIN_SIZE);
-        domain->virtual_addr = nullptr;
-        throw std::runtime_error("lseek 失败: " + std::string(strerror(errno)));
-    }
+    std::cout << "[RKMEM]: Domain " << domain->id << " reading data from file..." << std::endl;
     
-    // 6. 循环读取数据（使用较大的块提高效率）
-    const size_t block_size = 4 * 1024 * 1024;  // 4MB per read
-    size_t bytes_read_total = 0;
-    uint64_t va = (uint64_t)domain->virtual_addr;
+    // 5. 先按文件偏移排序 tensors（关键：确保顺序正确）
+    std::sort(domain->tensors.begin(), domain->tensors.end(), 
+              [](const auto& a, const auto& b) { return a.second < b.second; });
     
-    while (bytes_read_total < domain->used_size) {
-        size_t to_read = std::min(block_size, domain->used_size - bytes_read_total);
-        ssize_t bytes_read = read(fd, (void*)(va + bytes_read_total), to_read);
+    // 6. 读取所有 tensor 数据（保持文件中的相对位置关系）
+    const size_t progress_read = 512 * 1024 * 1024;  // 512 MB
+    size_t total_read = 0;
+    
+    for (auto& [tensor, file_offset] : domain->tensors) {
+        // 计算 tensor 大小
+        size_t tensor_size = ggml_nbytes(tensor);
+        std::cout << tensor_size << std::endl;
+        // **关键：在内存中的偏移 = 文件偏移 - domain 起始偏移**
+        // 这样保持了文件中的对齐和间隙
+        size_t offset_in_domain = file_offset - domain->offset_in_file;
+        void* tensor_addr = (uint8_t*)domain->virtual_addr + offset_in_domain;
         
-        if (bytes_read < 0) {
-            if (errno == EINTR) continue;  // 信号中断，重试
-            std::string err_msg = "读取文件失败: " + std::string(strerror(errno)) + 
-                                  ", 已读取=" + std::to_string(bytes_read_total) + " bytes";
+        // 打印所有 tensor 的信息（调试用）
+        static int tensor_count = 0;
+        std::cout << "[RKMEM]:   Tensor " << tensor_count 
+                  << ": addr=" << std::hex << tensor_addr << std::dec
+                  << ", size=" << tensor_size 
+                  << ", file_offset=" << file_offset
+                  << ", domain_offset_in_file=" << domain->offset_in_file
+                  << ", offset_in_domain=" << offset_in_domain
+                  << std::endl;
+        tensor_count++;
+        
+        // 从文件读取数据
+        if (lseek(fd, file_offset, SEEK_SET) == -1) {
             close(fd);
             munlock(domain->virtual_addr, DOMAIN_SIZE);
             munmap(domain->virtual_addr, DOMAIN_SIZE);
             domain->virtual_addr = nullptr;
-            throw std::runtime_error(err_msg);
-        }
-        if (bytes_read == 0) {
-            break;  // 到达文件末尾
+            throw std::runtime_error("lseek 失败: " + std::string(strerror(errno)));
         }
         
-        bytes_read_total += bytes_read;
+        size_t bytes_read_total = 0;
+        while (bytes_read_total < tensor_size) {
+            size_t to_read = tensor_size - bytes_read_total;
+            ssize_t bytes_read = read(fd, (uint8_t*)tensor_addr + bytes_read_total, to_read);
+            
+            if (bytes_read < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                munlock(domain->virtual_addr, DOMAIN_SIZE);
+                munmap(domain->virtual_addr, DOMAIN_SIZE);
+                domain->virtual_addr = nullptr;
+                throw std::runtime_error("读取失败: " + std::string(strerror(errno)));
+            }
+            if (bytes_read == 0) break;
+            
+            bytes_read_total += bytes_read;
+            total_read += bytes_read;
+            
+            // 打印读取进度
+            if (total_read >= progress_read && total_read % progress_read < (size_t)bytes_read) {
+                std::cout << "[RKMEM]:   Read " << (total_read / 1024 / 1024) << " MB" << std::endl;
+            }
+        }
+        
+        // **关键验证：确保读取的数据真的在内存中并且可访问**
+        if (bytes_read_total < tensor_size) {
+            close(fd);
+            munlock(domain->virtual_addr, DOMAIN_SIZE);
+            munmap(domain->virtual_addr, DOMAIN_SIZE);
+            domain->virtual_addr = nullptr;
+            throw std::runtime_error("数据读取不完整: 期望 " + std::to_string(tensor_size) + 
+                                    ", 实际 " + std::to_string(bytes_read_total));
+        }
+        
+        // 立即验证内存可读（计算校验和）
+        uint64_t checksum = 0;
+        const uint8_t* data = (const uint8_t*)tensor_addr;
+        size_t sample_count = std::min(tensor_size, (size_t)1024);  // 只采样前 1KB
+        for (size_t i = 0; i < sample_count; i++) {
+            checksum += data[i];
+        }
+        (void)checksum;  // 防止编译器优化掉
+        
+        // 将 tensor 的数据指针指向对齐的地址
+        tensor->data = tensor_addr;
+        
+        // 验证内存可访问（读取前16字节）
+        volatile uint8_t test_byte = ((uint8_t*)tensor_addr)[0];
+        if (tensor_size >= 16) {
+            volatile uint8_t test_byte_15 = ((uint8_t*)tensor_addr)[15];
+            (void)test_byte_15;  // 防止编译器优化掉
+        }
+        (void)test_byte;  // 防止编译器优化掉
     }
     
-    // 7. 关闭文件
     close(fd);
     
-    std::cout << "Domain id " << domain->id << " [RKMEM]: Mapped " 
-              << bytes_read_total << " bytes from " << path 
-              << " at offset " << offset 
-              << " to virtual address " << domain->virtual_addr << std::endl;
+    std::cout << "[RKMEM]: Domain " << domain->id << " data loaded: " 
+              << total_read << " bytes (" 
+              << (total_read / 1024.0 / 1024.0) << " MB) from " << path << std::endl;
+    
+    // **关键验证：在 IOMMU 映射之前，验证所有 tensor 数据都可以被 CPU 访问**
+    std::cout << "[RKMEM]: Domain " << domain->id << " verifying CPU access to all tensors..." << std::endl;
+    for (size_t i = 0; i < domain->tensors.size(); i++) {
+        auto& [tensor, file_offset] = domain->tensors[i];
+        volatile uint8_t* ptr = (volatile uint8_t*)tensor->data;
+        size_t size = ggml_nbytes(tensor);
+        
+        // 采样验证：读取首、中、尾三个位置
+        volatile uint8_t test1 = ptr[0];
+        volatile uint8_t test2 = ptr[size / 2];
+        volatile uint8_t test3 = ptr[size - 1];
+        (void)test1; (void)test2; (void)test3;
+        
+        if (i < 3) {  // 只打印前3个
+            std::cout << "[RKMEM]:   Tensor " << i << " @ " << std::hex << (void*)ptr << std::dec 
+                      << ", size=" << size << " - CPU access OK" << std::endl;
+        }
+    }
+    std::cout << "[RKMEM]: Domain " << domain->id << " all tensors verified before IOMMU mapping" << std::endl;
 }

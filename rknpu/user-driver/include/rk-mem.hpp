@@ -9,9 +9,9 @@
 #include "utils.h"
 #include <sys/syscall.h>
 extern "C" {
-#include <rknpu-ioctl.h>
-#include <npu_interface.h>
-#include <npu_matmul.h>
+#include "rknpu-ioctl.h"
+#include "npu_interface.h"
+#include "npu_matmul.h"
 }
 
 // some comments say the length of npu_regs must be 112; currently 108 still seems ok
