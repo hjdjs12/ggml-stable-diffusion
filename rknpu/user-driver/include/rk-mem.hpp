@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <errno.h>
+#include <string.h>
 #include <mutex>
 #include <atomic>
 #include <sys/ioctl.h>
@@ -81,7 +83,12 @@ class Memory : public MemoryInternal {
             if(ret < 0)
                 printf("DRM_IOCTL_RKNPU_MEM_DESTROY return value: %d\n", ret);
         } else {
-            check(ioctl(Memory::get_fd(), cmd, act) == 0, "rknpu ioctl failed\n");
+            int ret = ioctl(Memory::get_fd(), cmd, act);
+            if (ret != 0) {
+                printf("rknpu ioctl failed: cmd=0x%x, ret=%d, errno=%d (%s)\n", 
+                       cmd, ret, errno, strerror(errno));
+            }
+            check(ret == 0, "rknpu ioctl failed\n");
         }
         recall_num();
     }

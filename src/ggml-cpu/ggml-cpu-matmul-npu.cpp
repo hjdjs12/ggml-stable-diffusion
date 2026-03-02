@@ -115,17 +115,29 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id, int
 
 static Domain* find_tensor_domain(const void* tensor_data) {
     uint64_t addr = (uint64_t)tensor_data;
-    for (auto& [handle, domain_ptr] : domain_map) {
-        uint64_t va = (uint64_t)domain_ptr->virtual_addr;
-        if (addr >= va && addr < va + DOMAIN_SIZE) {
-            return domain_ptr;
+    // Iterate through all FileDomains in file_mapping
+    for (auto& [file_path, file_domains] : file_mapping) {
+        if (!file_domains) continue;
+        // Iterate through all Domains in each FileDomains
+        for (auto* domain_ptr : file_domains->domains) {
+            if (!domain_ptr || !domain_ptr->virtual_addr) continue;
+            uint64_t va = (uint64_t)domain_ptr->virtual_addr;
+            if (addr >= va && addr < va + DOMAIN_SIZE) {
+                return domain_ptr;
+            }
         }
     }
     return nullptr;
 }
 
 static int get_default_domain_id() {
-    return domain_map.empty() ? 0 : domain_map.begin()->second->id;
+    // Search through file_mapping to find first available domain
+    for (auto& [file_path, file_domains] : file_mapping) {
+        if (file_domains && !file_domains->domains.empty()) {
+            return file_domains->domains[0]->id;
+        }
+    }
+    return 0;
 }
 
 static inline int ceil_int(int x, int y) {
