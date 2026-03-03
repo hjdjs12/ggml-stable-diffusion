@@ -110,43 +110,63 @@ private:
 public:
    
 };
-
 inline IommuConfig * iommu_create_domain(void *virtual_addr, uint64_t domain_id, size_t used_size) {
-    // Implementation for creating an IOMMU domain
-    if (virtual_addr == nullptr) {  // ✅ 加个安全检查
-        throw std::runtime_error("virtual_addr is null, call mmap_domain_data first!");
-    }
-    
-    // ✅ CRITICAL FIX: Align address to page boundary (4KB = 4096 bytes)
-    // NPU IOMMU requires page-aligned addresses
-    // PAGE_SIZE is already defined in rk-mem.hpp
     uintptr_t addr_int = reinterpret_cast<uintptr_t>(virtual_addr);
-    uintptr_t page_offset = addr_int & (PAGE_SIZE - 1);  // Offset within page
-    uintptr_t aligned_addr = addr_int - page_offset;     // Round down to page boundary
-    size_t aligned_size = (used_size + page_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);  // Round up size
+    uintptr_t page_offset = addr_int & (PAGE_SIZE - 1);
+    uintptr_t aligned_addr = addr_int - page_offset;
     
     struct rknpu_mem_create mem_create = {};
-    mem_create.flags = RKNPU_MEM_ALLOCATED ;
-    //               RKNPU_MEM_CACHEABLE |
-    //               RKNPU_MEM_NON_CONTIGUOUS |              // 允许非连续物理内存
-    //               RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;    // 限制IOVA对齐（内核日志提示）
-
-    mem_create.size = aligned_size;  // Use aligned size
-    mem_create.usr_va = aligned_addr;  // Use aligned address
+    mem_create.flags = RKNPU_MEM_ALLOCATED;
+    
+    // ✅ 传递原始大小，不要对齐
+    mem_create.size = used_size;          // 原始大小
+    mem_create.usr_va = aligned_addr;      // 对齐的地址
     mem_create.iommu_domain_id = domain_id;
     
     rknpu_ioctl(DRM_IOCTL_RKNPU_MEM_CREATE, &mem_create, domain_id);
     
-    if (mem_create.dma_addr == 0) {
-        throw std::runtime_error("IOMMU mapping failed: dma_addr is 0");
-    }
-    
+    // ✅ 返回DMA地址时加上页内偏移
     IommuConfig* config = new IommuConfig();
-    // Add the page offset back to the DMA address so it points to the actual tensor data
     config->iommu_addr = (void*)(mem_create.dma_addr + page_offset);
     config->mem_obj_handle = new uint64_t(mem_create.handle);
     return config;
 }
+// inline IommuConfig * iommu_create_domain(void *virtual_addr, uint64_t domain_id, size_t used_size) {
+//     // Implementation for creating an IOMMU domain
+//     if (virtual_addr == nullptr) {  // ✅ 加个安全检查
+//         throw std::runtime_error("virtual_addr is null, call mmap_domain_data first!");
+//     }
+    
+//     // ✅ CRITICAL FIX: Align address to page boundary (4KB = 4096 bytes)
+//     // NPU IOMMU requires page-aligned addresses
+//     // PAGE_SIZE is already defined in rk-mem.hpp
+//     uintptr_t addr_int = reinterpret_cast<uintptr_t>(virtual_addr);
+//     uintptr_t page_offset = addr_int & (PAGE_SIZE - 1);  // Offset within page
+//     uintptr_t aligned_addr = addr_int - page_offset;     // Round down to page boundary
+//     size_t aligned_size = (used_size + page_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);  // Round up size
+    
+//     struct rknpu_mem_create mem_create = {};
+//     mem_create.flags = RKNPU_MEM_ALLOCATED ;
+//     //               RKNPU_MEM_CACHEABLE |
+//     //               RKNPU_MEM_NON_CONTIGUOUS |              // 允许非连续物理内存
+//     //               RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;    // 限制IOVA对齐（内核日志提示）
+
+//     mem_create.size = aligned_size;  // Use aligned size
+//     mem_create.usr_va = aligned_addr;  // Use aligned address
+//     mem_create.iommu_domain_id = domain_id;
+    
+//     rknpu_ioctl(DRM_IOCTL_RKNPU_MEM_CREATE, &mem_create, domain_id);
+    
+//     if (mem_create.dma_addr == 0) {
+//         throw std::runtime_error("IOMMU mapping failed: dma_addr is 0");
+//     }
+    
+//     IommuConfig* config = new IommuConfig();
+//     // Add the page offset back to the DMA address so it points to the actual tensor data
+//     config->iommu_addr = (void*)(mem_create.dma_addr + page_offset);
+//     config->mem_obj_handle = new uint64_t(mem_create.handle);
+//     return config;
+// }
 
 struct FileDomains{
     std::vector<Domain*> domains;
