@@ -105,13 +105,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         
         list(APPEND GGML_CPU_SOURCES
                     ggml-cpu/ggml-cpu-matmul-npu.cpp
-                    ggml-cpu/ggml-cpu-matmul-npu.h)
+                    ggml-cpu/ggml-cpu-matmul-npu.h
+                    ${CMAKE_SOURCE_DIR}/ggml/rknpu/user-driver/src/npu_matmul.c
+                    ${CMAKE_SOURCE_DIR}/ggml/rknpu/user-driver/src/npu_interface.c)
         
         # 添加 RKNPU 用户驱动相关的头文件路径
         target_include_directories(${GGML_CPU_NAME} PRIVATE
-            ../../rknpu/user-driver/include
-            ../../rknpu/user-driver/src
-            ../../rknpu/user-driver)
+            ${CMAKE_SOURCE_DIR}/ggml/rknpu/user-driver/include
+            ${CMAKE_SOURCE_DIR}/ggml/rknpu/user-driver/src
+            ${CMAKE_SOURCE_DIR}/ggml/rknpu/user-driver)
     endif()
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
