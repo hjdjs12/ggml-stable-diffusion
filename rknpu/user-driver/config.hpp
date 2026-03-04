@@ -115,6 +115,32 @@ inline IommuConfig * iommu_create_domain(void *virtual_addr, uint64_t domain_id,
     uintptr_t page_offset = addr_int & (PAGE_SIZE - 1);
     uintptr_t aligned_addr = addr_int - page_offset;
     
+    // 🔍 详细诊断信息
+    printf("\n=== IOMMU Domain Creation Debug ===\n");
+    printf("Original addr: 0x%lx (alignment: %s)\n", 
+           addr_int, (page_offset == 0) ? "aligned" : "NOT aligned");
+    printf("Page offset:   0x%lx (%lu bytes)\n", page_offset, page_offset);
+    printf("Aligned addr:  0x%lx\n", aligned_addr);
+    printf("Used size:     %zu bytes\n", used_size);
+    printf("Size+offset:   %zu bytes\n", used_size + page_offset);
+    
+    // 检查内存是否可访问
+    volatile char test_read;
+    bool orig_readable = false, aligned_readable = false;
+    try {
+        test_read = *((volatile char*)virtual_addr);
+        orig_readable = true;
+    } catch (...) {}
+    
+    try {
+        test_read = *((volatile char*)aligned_addr);
+        aligned_readable = true;
+    } catch (...) {}
+    
+    printf("Original addr readable: %s\n", orig_readable ? "YES" : "NO");
+    printf("Aligned addr readable:  %s\n", aligned_readable ? "YES" : "NO");
+    printf("==================================\n\n");
+    
     struct rknpu_mem_create mem_create = {};
     mem_create.flags = RKNPU_MEM_ALLOCATED;
     

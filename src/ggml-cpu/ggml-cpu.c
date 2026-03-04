@@ -3225,12 +3225,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
+        printf("aaaa\n");
         #pragma omp parallel num_threads(n_threads)
         {
             #pragma omp single
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
+                printf("bbb\n");
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 

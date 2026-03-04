@@ -224,14 +224,57 @@ static void extract_q8_0(
     const int QK = 32;
     const int nb = ncols / QK;
     
-    #pragma omp parallel for
+    // Debug: Check memory validity before parallel access
+    printf("[DEBUG] extract_q8_0: blocks=%p, nrows=%d, ncols=%d, nb=%d\n", 
+           blocks, nrows, ncols, nb);
+    printf("[DEBUG] extract_q8_0: int8_out=%p, scales_out=%p\n", int8_out, scales_out);
+    printf("[DEBUG] extract_q8_0: total blocks=%d, total bytes=%zu\n", 
+           nrows * nb, nrows * nb * sizeof(block_q8_0));
+    
+    // Test if first block is readable
+    printf("[DEBUG] Testing first block access...\n");
+    volatile uint8_t test_byte = ((const uint8_t*)blocks)[0];
+    printf("[DEBUG] First byte: 0x%02x (readable)\n", test_byte);
+    
+    // Test if we can read the first block_q8_0 structure
+    printf("[DEBUG] Testing first block_q8_0...\n");
+    const block_q8_0& first_blk = blocks[0];
+    volatile uint16_t d = first_blk.d;
+    volatile int8_t q0 = first_blk.qs[0];
+    printf("[DEBUG] First block: d=0x%04x, qs[0]=%d\n", d, q0);
+    
+    // TEMPORARY FIX: Disable OpenMP to isolate the issue
+    // If this works, the problem is with parallel memory access
+    // #pragma omp parallel for
     for (int i = 0; i < nrows; i++) {
+        if (i % 1024 == 0) {
+            printf("[DEBUG] Processing row %d/%d\n", i, nrows);
+        }
         for (int j = 0; j < nb; j++) {
+            // Detailed debug for first few blocks
+            if (i == 0 && j < 5) {
+                printf("[DEBUG] Block [%d,%d]: blk=%p, blk.d=0x%04x, blk.qs=%p\n", 
+                       i, j, &blocks[i * nb + j], blocks[i * nb + j].d, blocks[i * nb + j].qs);
+                printf("[DEBUG]   scales_out[%d]=%p, int8_out dest=%p\n",
+                       i * nb + j, &scales_out[i * nb + j], int8_out + i * ncols + j * QK);
+            }
+            
             const block_q8_0& blk = blocks[i * nb + j];
             scales_out[i * nb + j] = GGML_FP16_TO_FP32(blk.d);
-            memcpy(int8_out + i * ncols + j * QK, blk.qs, QK);
+            
+            // CRITICAL FIX: Use byte-wise copy instead of memcpy
+            // blk.qs has +2 offset (not 4-byte aligned), which can cause SIGBUS
+            // when memcpy uses NEON/SIMD instructions on mmap memory
+            int8_t* dst = int8_out + i * ncols + j * QK;
+            const int8_t* src = blk.qs;
+            
+            // Manual copy to avoid alignment issues
+            for (int k = 0; k < QK; k++) {
+                dst[k] = src[k];
+            }
         }
     }
+    printf("[DEBUG] extract_q8_0: completed successfully\n");
 }
 
 // NPU layout conversion helper (from reference code)
@@ -257,7 +300,8 @@ static void to_npu_feature_layout(const int8_t* src, int M, int K, int8_t* dst) 
     const int K_aligned = (K + 15) & ~15;
     memset(dst, 0, M * K_aligned);
     
-    #pragma omp parallel for
+    // TEMPORARY FIX: Disable OpenMP
+    // #pragma omp parallel for
     for (int m = 0; m < M; m++) {
         for (int k = 0; k < K; k++) {
             dst[feature_data(M, 16, k, m)] = src[m * K + k];
@@ -269,7 +313,8 @@ static void to_npu_weight_layout(const int8_t* src, int N, int K, int8_t* dst) {
     const int K_aligned = (K + 31) & ~31;
     memset(dst, 0, N * K_aligned);
     
-    #pragma omp parallel for
+    // TEMPORARY FIX: Disable OpenMP
+    // #pragma omp parallel for
     for (int n = 0; n < N; n++) {
         for (int k = 0; k < K; k++) {
             dst[weight_int8(K_aligned, k, n)] = src[n * K + k];
@@ -336,9 +381,12 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id, int
  * - NPU writes to buffer 0 while CPU reads from buffer 1
  * - Uses NEON instructions for dequantization
  * - Cache prefetching for better performance
+ * 
+ * NOTE: Quantization and IOMMU mapping are done earlier in model.cpp
+ *       This function works with pre-quantized Q8_0 tensors that have DMA addresses
  */
 static void compute_matmul_q8_0_parallel(
-    const struct ggml_tensor* src0,  // weight (M x K, Q8_0)
+    const struct ggml_tensor* src0,  // weight (M x K, Q8_0, pre-quantized with IOMMU)
     const struct ggml_tensor* src1,  // input (N x K, FP32)
     struct ggml_tensor* dst,         // output (N x M, FP32)
     int domain_id) {
@@ -348,7 +396,12 @@ static void compute_matmul_q8_0_parallel(
     const int N = src1->ne[1];
     const int QK = 32;
     
-    // Step 1: Quantize input to Q8_0
+    // Step 1: Quantize input to Q8_0 (input is still FP32, not pre-quantized)
+    printf("[DEBUG] Allocating input buffers: N=%d, K=%d, QK=%d\n", N, K, QK);
+    printf("[DEBUG]   input_q8 size: %zu blocks\n", (size_t)(N * K) / QK);
+    printf("[DEBUG]   input_int8 size: %zu bytes\n", (size_t)(N * K));
+    printf("[DEBUG]   input_scales size: %zu floats\n", (size_t)(N * K) / QK);
+    
     std::vector<block_q8_0> input_q8((N * K) / QK);
     quantize_row_q8_0_ref((const float*)src1->data, input_q8.data(), N * K);
     
@@ -356,46 +409,52 @@ static void compute_matmul_q8_0_parallel(
     std::vector<float> input_scales(N * K / QK);
     extract_q8_0(input_q8.data(), N, K, input_int8.data(), input_scales.data());
     
-    // Step 2: Convert weight to Q8_0 if needed
-    std::vector<block_q8_0> weight_q8;
-    std::vector<int8_t> weight_int8(M * K);
-    std::vector<float> weight_scales(M * K / QK);
+    // Step 2: Extract weight data (already Q8_0 with IOMMU mapping)
+    printf("[DEBUG] Allocating weight buffers: M=%d, K=%d, QK=%d\n", M, K, QK);
+    printf("[DEBUG]   weight_int8 size: %zu bytes (%.2f MB)\n", (size_t)(M * K), (M * K) / 1024.0 / 1024.0);
+    printf("[DEBUG]   weight_scales size: %zu floats (%.2f MB)\n", (size_t)(M * K) / QK, ((M * K) / QK * 4) / 1024.0 / 1024.0);
     
-    if (src0->type == GGML_TYPE_Q8_0) {
-        // Already Q8_0
-        extract_q8_0((const block_q8_0*)src0->data, M, K, weight_int8.data(), weight_scales.data());
-    } else {
-        // Convert to Q8_0
-        std::vector<float> weight_fp32(M * K);
+    // CRITICAL: Check if allocation is feasible
+    size_t required_bytes = (size_t)M * K + ((size_t)M * K / QK) * sizeof(float);
+    printf("[DEBUG] Total memory required: %.2f MB\n", required_bytes / 1024.0 / 1024.0);
+    
+    std::vector<int8_t> weight_int8;
+    std::vector<float> weight_scales;
+    
+    try {
+        printf("[DEBUG] Allocating weight_int8...\n");
+        weight_int8.resize(M * K);
+        printf("[DEBUG]   weight_int8.data() = %p, size() = %zu, capacity() = %zu\n", 
+               weight_int8.data(), weight_int8.size(), weight_int8.capacity());
         
-        // Dequantize to FP32 first using type-specific functions
-        const size_t type_size = ggml_type_size(src0->type);
-        const size_t blck_size = ggml_blck_size(src0->type);
-        const size_t row_size = (K / blck_size) * type_size;
+        printf("[DEBUG] Allocating weight_scales...\n");
+        weight_scales.resize(M * K / QK);
+        printf("[DEBUG]   weight_scales.data() = %p, size() = %zu, capacity() = %zu\n", 
+               weight_scales.data(), weight_scales.size(), weight_scales.capacity());
         
-        // Use ggml_compute_forward_dup_f32 or type-specific dequantize
-        // For now, use a simple approach with ggml_get_rows
-        for (int64_t i = 0; i < M; i++) {
-            const void* src_row = (const char*)src0->data + i * row_size;
-            float* dst_row = weight_fp32.data() + i * K;
-            // Use GGML's dequantization: ggml_type_traits has from_float_to_vec_dot
-            // For simplicity, handle common types manually
-            if (src0->type == GGML_TYPE_F32) {
-                memcpy(dst_row, src_row, K * sizeof(float));
-            } else if (src0->type == GGML_TYPE_F16) {
-                ggml_fp16_to_fp32_row((const ggml_fp16_t*)src_row, dst_row, K);
-            } else {
-                // For other quantized types, use vec_dot to dequantize
-                // This is a fallback - ideally use type-specific functions
-                fprintf(stderr, "[NPU] Unsupported weight type for conversion: %d\n", src0->type);
-                throw std::runtime_error("Unsupported weight type");
-            }
-        }
+        // Test write to first element
+        printf("[DEBUG] Testing write access to weight_int8[0]...\n");
+        weight_int8[0] = 123;
+        printf("[DEBUG]   Write successful, value = %d\n", weight_int8[0]);
         
-        weight_q8.resize((M * K) / QK);
-        quantize_row_q8_0_ref(weight_fp32.data(), weight_q8.data(), M * K);
-        extract_q8_0(weight_q8.data(), M, K, weight_int8.data(), weight_scales.data());
+        printf("[DEBUG] Testing write access to weight_int8[last]...\n");
+        weight_int8[M * K - 1] = 45;
+        printf("[DEBUG]   Write successful, value = %d\n", weight_int8[M * K - 1]);
+        
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[NPU] Failed to allocate weight buffers: %s\n", e.what());
+        throw;
     }
+    
+    // Weight tensor should already be Q8_0 format with IOMMU mapping
+    if (src0->type != GGML_TYPE_Q8_0) {
+        fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to Q8_0, got type %d\n", src0->type);
+        throw std::runtime_error("Weight tensor not pre-quantized");
+    }
+    
+    // Extract INT8 data and scales from pre-quantized weight
+    printf("[DEBUG] Extracting weight data from src0->data=%p\n", src0->data);
+    extract_q8_0((const block_q8_0*)src0->data, M, K, weight_int8.data(), weight_scales.data());
     
     // Step 3: Convert to NPU layout
     const int K_in = (K + 15) & ~15;
@@ -407,20 +466,41 @@ static void compute_matmul_q8_0_parallel(
     std::vector<int8_t> weight_npu(M * K_w);
     to_npu_weight_layout(weight_int8.data(), M, K, weight_npu.data());
     
-    // Step 4: Allocate NPU-accessible memory and copy data
-    // NOTE: In full implementation, this would use Memory class with DMA allocation
-    // For now, use regular memory (NPU submission is placeholder anyway)
+    // Step 4: Get DMA addresses from existing IOMMU mappings
+    // Weight tensor should already have IOMMU mapping created in model.cpp
+    Domain* weight_domain = find_tensor_domain(src0->data);
+    uint64_t weight_dma_base = 0;
+    
+    if (weight_domain) {
+        // Find the tensor in the domain's tensor map to get its IommuConfig
+        for (auto& [name, tensor_tuple] : weight_domain->tensors) {
+            auto* tensor = std::get<0>(tensor_tuple);
+            if (tensor && tensor->data == src0->data) {
+                IommuConfig* iommu_config = std::get<2>(tensor_tuple);
+                if (iommu_config && iommu_config->iommu_addr) {
+                    weight_dma_base = (uint64_t)iommu_config->iommu_addr;
+                    fprintf(stderr, "[NPU] Found weight DMA address: 0x%lx\n", weight_dma_base);
+                    break;
+                }
+            }
+        }
+    }
+    
+    // For input, we need to allocate temporary DMA buffer (input is runtime data)
     std::vector<int8_t> input_dma_buf(N * K_in);
     memcpy(input_dma_buf.data(), input_npu.data(), N * K_in);
     flush_cache(input_dma_buf.data(), N * K_in);
-    
-    std::vector<int8_t> weight_dma_buf(M * K_w);
-    memcpy(weight_dma_buf.data(), weight_npu.data(), M * K_w);
-    flush_cache(weight_dma_buf.data(), M * K_w);
-    
-    // Get DMA addresses (placeholder - would be actual physical addresses)
     uint64_t input_dma_base = (uint64_t)input_dma_buf.data();
-    uint64_t weight_dma_base = (uint64_t)weight_dma_buf.data();
+    
+    // If weight doesn't have DMA address yet, fall back to temporary buffer
+    // (This shouldn't happen if quantization pipeline is working correctly)
+    if (weight_dma_base == 0) {
+        fprintf(stderr, "[NPU] Warning: Weight tensor has no IOMMU mapping, using temporary buffer\n");
+        std::vector<int8_t> weight_dma_buf(M * K_w);
+        memcpy(weight_dma_buf.data(), weight_npu.data(), M * K_w);
+        flush_cache(weight_dma_buf.data(), M * K_w);
+        weight_dma_base = (uint64_t)weight_dma_buf.data();
+    }
     
     // Step 5: Build task list (block splitting)
     auto tasks = std::make_shared<std::vector<std::tuple<int, int, matmul_task_t>>>();
@@ -585,10 +665,10 @@ int ggml_can_use_npu(const struct ggml_tensor* src0, const struct ggml_tensor* s
     // Input must be FP32
     if (src1->type != GGML_TYPE_F32) return 0;
     
-    // Weight must be F32, F16, or Q8_0 (convertible types)
-    if (src0->type != GGML_TYPE_F32 && 
-        src0->type != GGML_TYPE_F16 && 
-        src0->type != GGML_TYPE_Q8_0) {
+    // Weight must be Q8_0 (pre-quantized in model loading stage)
+    // NOTE: With the new pipeline, weights should already be Q8_0
+    if (src0->type != GGML_TYPE_Q8_0) {
+        fprintf(stderr, "[NPU] Weight type is %d, expected Q8_0 (pre-quantized)\n", src0->type);
         return 0;
     }
     
