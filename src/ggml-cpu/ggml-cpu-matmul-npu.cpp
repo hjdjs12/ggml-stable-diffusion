@@ -16,7 +16,7 @@
  * 
  * Reference Architecture:
  * - Based on rk3588-npu matrix multiplication implementation
- * - Supports block splitting: BLOCK_WEIGHT (256) × BLOCK_SHARED (4096)
+ * - Supports block splitting: BLOCK_WEIGHT (256) × BLOCK_SHARED (512)
  * - Double buffering: buffer_free[2] for CPU/NPU synchronization
  * - Task batching: TASKS_LOCAL_PER_NUM (2-3) tasks per submission
  * 
@@ -66,7 +66,7 @@
 // ============================================================================
 
 static bool g_npu_initialized = false;
-static int g_npu_fd = -1;
+int g_npu_fd = -1;  // Global NPU fd (used by config.hpp)
 
 // Cache manager 全局变量
 static int manager_cache_fd = -1;  
@@ -99,7 +99,7 @@ struct cache_inval_range {
 constexpr int LOOKAHEAD = 12;
 constexpr int PER_TASK_CORE_NUM = 3;
 constexpr int BLOCK_WEIGHT = 256;
-constexpr int BLOCK_SHARED = 4096;
+constexpr int BLOCK_SHARED = 512;  // Reduced to fit NPU CBUF limit: max(M×K) ≤ 11×32KB = 360KB
 constexpr uint32_t BATCH_SIZE = 512;
 constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
 
@@ -216,6 +216,7 @@ static void npu_work() {
         npu_tasks_shared = std::make_shared<std::vector<int32_t*>>(tasks->size(), nullptr);
         int index = 0;
 
+        std::cout << " tasks to submit to NPU, total tasks: " << TASKS_LOCAL_PER_NUM  << std::endl;
         for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
             // Prepare task batch
             rknpu_tasks_t _t = {};
@@ -349,7 +350,11 @@ inline int weight_int8(int C, int k, int c) {
 
 static void to_npu_feature_layout(const int8_t* src, int M, int K, int8_t* dst) {
     const int K_aligned = (K + 15) & ~15;
-    memset(dst, 0, M * K_aligned);
+    // Use simple loop instead of memset to avoid NEON SIMD alignment requirements
+    // (IOMMU memory may not satisfy alignment needed by optimized memset)
+    for (size_t i = 0; i < M * K_aligned; i++) {
+        dst[i] = 0;
+    }
     
     // TEMPORARY FIX: Disable OpenMP
     // #pragma omp parallel for
@@ -362,7 +367,11 @@ static void to_npu_feature_layout(const int8_t* src, int M, int K, int8_t* dst) 
 
 static void to_npu_weight_layout(const int8_t* src, int N, int K, int8_t* dst) {
     const int K_aligned = (K + 31) & ~31;
-    memset(dst, 0, N * K_aligned);
+    // Use simple loop instead of memset to avoid NEON SIMD alignment requirements
+    // (IOMMU memory may not satisfy alignment needed by optimized memset)
+    for (size_t i = 0; i < N * K_aligned; i++) {
+        dst[i] = 0;
+    }
     
     // TEMPORARY FIX: Disable OpenMP
     // #pragma omp parallel for
@@ -471,14 +480,20 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
 
     // 获取 LeftMemory 的虚拟地址和 DMA 地址
     uint8_t* regcmd_va = static_cast<uint8_t*>(domain->regcmd->virtual_addr);
-    uint64_t regcmd_dma = reinterpret_cast<uint64_t>(domain->regcmd->iommu_addr);
+    uint64_t regcmd_dma = domain->regcmd->iommu_addr;
     size_t regcmd_size = domain->regcmd->size;
     
     rknpu_task* tasks_va = static_cast<rknpu_task*>(domain->tasks_mem->virtual_addr);
-    uint64_t tasks_obj = *domain->tasks_mem->mem_obj_handle;  // 解引用获取句柄值
+    uint64_t tasks_obj = domain->tasks_mem->obj_addr;  // mem_obj_handle 现在是 uint32_t
     
+    std::cout << "[rknpu_matmul] Submitting tasks to NPU, Domain ID: " << domain_id 
+              << ", regcmd VA: " << static_cast<void*>(regcmd_va) 
+              << ", regcmd DMA: " << std::hex << regcmd_dma << std::dec 
+              << ", tasks VA: " << static_cast<void*>(tasks_va) 
+              << ", tasks OBJ: " << tasks_obj << std::endl;
+
     int32_t* output_va = static_cast<int32_t*>(domain->output->virtual_addr);
-    uint64_t output_dma = reinterpret_cast<uint64_t>(domain->output->iommu_addr);
+    uint64_t output_dma = domain->output->iommu_addr;
 
     uint64_t off = 0;  // 寄存器命令偏移量
     int task_num = 0;  // 实际任务数量
@@ -552,7 +567,7 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
         .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,  // 任务标志
         .timeout = 6000,          // 超时时间（毫秒）
         .task_start = 0,
-        .task_number = 1,
+        .task_number = 1,  // ✅ 修复：使用实际任务数
         .task_counter = 0,
         .priority = 0,
         .task_obj_addr = tasks_obj,  // 任务描述符对象句柄
@@ -562,7 +577,7 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
         .hw_elapse_time = 0,
         .core_mask = core_mask,  // NPU 核心掩码
         .fence_fd = -1,
-        .subcore_task =  // 子核心任务分配
+        .subcore_task =  // 子核心任务分配：每个核心分配的任务数
             {
                 {0, task_num >= 1},  // 核心 0：如果有至少 1 个任务
                 {1, task_num >= 2},  // 核心 1：如果有至少 2 个任务
@@ -679,7 +694,7 @@ static void compute_matmul_q8_0_parallel(
                 to_npu_weight_layout(weight_int8.data(), M, K, (int8_t*)src0->data);
                 
                 // Use the existing IOMMU DMA address
-                weight_dma_base = (uint64_t)iommu_config->iommu_addr;
+                weight_dma_base = iommu_config->iommu_addr;
                 fprintf(stderr, "[NPU] Reusing IOMMU DMA address: 0x%lx (tensor->data=%p)\n", 
                         weight_dma_base, src0->data);
                 
@@ -696,13 +711,32 @@ static void compute_matmul_q8_0_parallel(
         }
     }
     
-    // For input, we need to allocate temporary DMA buffer (input is runtime data)
-    std::vector<int8_t> input_dma_buf(N * K_in);
-    memcpy(input_dma_buf.data(), input_npu.data(), N * K_in);
-    flush_cache(input_dma_buf.data(), N * K_in);
-    uint64_t input_dma_base = (uint64_t)input_dma_buf.data();
+    // ✅ Step 4.5: Get Domain for input buffer (use specialized IOMMU-mapped buffer)
+    Domain* input_domain = find_domain_by_id(domain_id);
+    if (!input_domain || !input_domain->input) {
+        fprintf(stderr, "[NPU] ERROR: Domain %d not found or input buffer not allocated\n", domain_id);
+        throw std::runtime_error("Input IOMMU buffer not available");
+    }
     
-    // Fallback: if no IOMMU mapping found, create temporary buffer
+    // Check buffer size
+    size_t input_size = N * K_in;
+    if (input_size > input_domain->input->size) {
+        fprintf(stderr, "[NPU] ERROR: Input size %zu exceeds buffer size %zu\n", 
+                input_size, input_domain->input->size);
+        throw std::runtime_error("Input buffer overflow");
+    }
+    
+    // Copy input data to IOMMU-mapped buffer
+    memcpy(input_domain->input->virtual_addr, input_npu.data(), input_size);
+    flush_cache(input_domain->input->virtual_addr, input_size);
+    uint64_t input_dma_base = input_domain->input->iommu_addr;
+    
+    fprintf(stderr, "[NPU] Input buffer: VA=%p, DMA=0x%lx, size=%zu\n", 
+            input_domain->input->virtual_addr, 
+            input_domain->input->iommu_addr, 
+            input_size);
+    
+    // Fallback: if no IOMMU mapping found for weight, create temporary buffer
     if (weight_dma_base == 0) {
         fprintf(stderr, "[NPU] Warning: No IOMMU mapping found, using temporary buffer\n");
         std::vector<int8_t> weight_dma_buf(M * K_w);

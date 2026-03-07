@@ -33,16 +33,21 @@
 #include "include/rknpu-ioctl.h"
 #include "include/rk-mem.hpp"
 #include "ggml.h"
-
+#include "include/common.h"
 // Forward declaration - TensorStorage is defined in model.h
 struct TensorStorage;
+
+// NPU file descriptor (defined in ggml-cpu-matmul-npu.cpp)
+extern int g_npu_fd;
 
 #define WEIGHT_SIZE (3696UL * 1024 * 1024)
 #define DOMAIN_SIZE (4096UL * 1024 * 1024)
 #define REGCMD_SIZE (64 * 1024)  // 64KB for register commands
 #define TASKS_MEM_SIZE (4 * 1024)  // 4KB for task descriptors
-#define NPU_INPUT_BUFFER_SIZE (100 * 1024 * 1024)  // 100MB for input/output buffers
-#define NPU_OUTPUT_BUFFER_SIZE (100 * 1024 * 1024)  // 100MB for output buffers
+#define NPU_INPUT_BUFFER_SIZE (50 * 1024 * 1024)  // 50MB for input/output buffers
+#define NPU_OUTPUT_BUFFER_SIZE (50 * 1024 * 1024)  // 50MB for output buffers
+
+
 
 inline uint64_t cur_max_domain_index = 0;   
 inline uint64_t cur_used_size = 0;
@@ -50,12 +55,21 @@ inline uint64_t cur_used_size = 0;
 class IommuConfig{
 
 public:
-    void *iommu_addr;
-    uint64_t *mem_obj_handle;
+    uint64_t iommu_addr;
+    uint64_t mem_obj_handle;
     uint64_t domain_id;
-    IommuConfig() : iommu_addr(nullptr), mem_obj_handle(nullptr) {}
+    IommuConfig() : iommu_addr(0), mem_obj_handle(0), domain_id(0) {}
 };
 
+
+
+
+struct MapOps {
+    std::string fp;         // 文件路径
+    uint64_t handle;        // 驱动返回的句柄（代替 localmmap 的 fd）
+    uint64_t va;            // 虚拟地址（映射后的地址）
+    uint64_t len;           // 映射长度
+};
 // ============================================================================
 // Forward Declarations - 前向声明
 // ============================================================================
@@ -66,7 +80,9 @@ public:
  * 实现位置：在 Domain 结构体定义之后
  */
 inline IommuConfig* iommu_create_domain(void *virtual_addr, uint64_t domain_id, size_t used_size);
-
+inline struct MapOps* mem_recallmem_mmap(size_t file_len);
+inline std::tuple<void*, uint64_t, uint64_t, uint64_t> mem_allocate(size_t size, uint32_t flags,
+                   uint64_t domain_id) ;
 class TensorInfo {
 public:
     uint64_t offset;
@@ -79,10 +95,11 @@ class LeftMemory {
 public:    
     size_t size;             // 内存大小
     void* virtual_addr;      // 虚拟地址（CPU 访问用）
-    void* iommu_addr;        // IOMMU DMA 地址（NPU 访问用）
-    uint64_t *mem_obj_handle; // IOMMU handle（用于释放）
+    uint64_t iommu_addr;        // IOMMU DMA 地址（NPU 访问用）
+    uint64_t mem_obj_handle; // IOMMU handle（用于释放）
+    uint64_t obj_addr;        // 驱动对象地址（如果需要）
     
-    LeftMemory() : size(0), virtual_addr(nullptr), iommu_addr(nullptr), mem_obj_handle(nullptr) {}
+    LeftMemory() : size(0), virtual_addr(nullptr), iommu_addr(0), mem_obj_handle(0) {}
     
     /**
      * @brief 分配内存并创建 IOMMU 映射
@@ -99,38 +116,46 @@ public:
         size = (mem_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
         
         // 1. 使用 mmap 分配匿名内存
-        virtual_addr = mmap(nullptr, size, 
-                           PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS,
-                           -1, 0);
+        // virtual_addr = mmap(nullptr, size, 
+        //                    PROT_READ | PROT_WRITE,
+        //                    MAP_PRIVATE | MAP_ANONYMOUS,
+        //                    -1, 0);
         
-        if (virtual_addr == MAP_FAILED) {
-            std::cerr << "[LeftMemory] mmap failed: " << strerror(errno) << std::endl;
-            throw std::runtime_error("LeftMemory: mmap allocation failed");
-        }
-        
+        // if (virtual_addr == MAP_FAILED) {
+        //     std::cerr << "[LeftMemory] mmap failed: " << strerror(errno) << std::endl;
+        //     throw std::runtime_error("LeftMemory: mmap allocation failed");
+        // }
+
+        auto result = mem_allocate(size, 0, domain_id);
+        virtual_addr = std::get<0>(result);
+        obj_addr = std::get<1>(result);
+        iommu_addr = std::get<2>(result);
+        mem_obj_handle = std::get<3>(result);
+
         // 2. 锁定内存（防止被 swap）
-        if (mlock(virtual_addr, size) != 0) {
-            std::cerr << "[LeftMemory] mlock failed: " << strerror(errno) << std::endl;
-            munmap(virtual_addr, size);
-            virtual_addr = nullptr;
-            throw std::runtime_error("LeftMemory: mlock failed");
-        }
+        // 注意：recallmem 驱动分配的内存通常已经锁定，mlock 可能失败但不影响功能
+        // if (mlock(virtual_addr, size) != 0) {
+        //     std::cerr << "[LeftMemory] Warning: mlock failed (" << strerror(errno) 
+        //               << "), but continuing (driver memory may already be locked)" << std::endl;
+        //     // 不抛出异常，继续执行
+        // } else {
+        //     std::cout << "[LeftMemory] Memory locked successfully" << std::endl;
+        // }
         
         // 3. 创建 IOMMU 映射
-        try {
-            IommuConfig* config = iommu_create_domain(virtual_addr, domain_id, size);
-            iommu_addr = config->iommu_addr;
-            mem_obj_handle = config->mem_obj_handle;
+        // try {
+            // IommuConfig* config = iommu_create_domain(virtual_addr, domain_id, size);
+            // iommu_addr = config->iommu_addr;
+            // mem_obj_handle = config->mem_obj_handle;
             // 注意：不要 delete config，因为它的成员已经被我们保存了
-            delete config;  // 只删除 config 对象本身
-        } catch (const std::exception& e) {
-            std::cerr << "[LeftMemory] IOMMU mapping failed: " << e.what() << std::endl;
-            munlock(virtual_addr, size);
-            munmap(virtual_addr, size);
-            virtual_addr = nullptr;
-            throw;
-        }
+            // delete config;  // 只删除 config 对象本身
+        // } catch (const std::exception& e) {
+        //     std::cerr << "[LeftMemory] IOMMU mapping failed: " << e.what() << std::endl;
+        //     munlock(virtual_addr, size);
+        //     munmap(virtual_addr, size);
+        //     virtual_addr = nullptr;
+        //     throw;
+        // }
         
         std::cout << "[LeftMemory] Allocated " << size << " bytes, VA=" << virtual_addr 
                   << ", DMA=" << iommu_addr << std::endl;
@@ -297,20 +322,24 @@ inline IommuConfig * iommu_create_domain(void *virtual_addr, uint64_t domain_id,
     uintptr_t page_offset = addr_int & (PAGE_SIZE - 1);
     uintptr_t aligned_addr = addr_int - page_offset;
     
+    // ✅ 对齐到页边界：包含页内偏移并向上对齐到 PAGE_SIZE
+    // 例如：offset=0x100, size=0x500 => aligned_size=0x1000 (4KB)
+    //      offset=0, size=44564480 => aligned_size=44564480 (已对齐)
+    size_t aligned_size = (page_offset + used_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    
     struct rknpu_mem_create mem_create = {};
     mem_create.flags = RKNPU_MEM_ALLOCATED;
     
-    // ✅ 传递原始大小，不要对齐
-    mem_create.size = used_size;          // 原始大小
-    mem_create.usr_va = aligned_addr;      // 对齐的地址
+    mem_create.size = aligned_size;        // ✅ 页对齐的大小
+    mem_create.usr_va = aligned_addr;      // ✅ 页对齐的地址
     mem_create.iommu_domain_id = domain_id;
     
     rknpu_ioctl(DRM_IOCTL_RKNPU_MEM_CREATE, &mem_create, domain_id);
     
     // ✅ 返回DMA地址时加上页内偏移
     IommuConfig* config = new IommuConfig();
-    config->iommu_addr = (void*)(mem_create.dma_addr + page_offset);
-    config->mem_obj_handle = new uint64_t(mem_create.handle);
+    config->iommu_addr = (uint64_t)(mem_create.dma_addr + page_offset);
+    config->mem_obj_handle = mem_create.handle;
     config->domain_id = domain_id;
     return config;
 }
@@ -442,3 +471,84 @@ inline void register_cleanup_handler() {
     }
 }
 
+
+
+inline const char* recallmem_file_path = "/dev/recallmem-ioctl";  // recallmem 驱动设备路径
+inline int _fd = -1;                            // recallmem 驱动文件描述符
+
+inline struct MapOps* mem_recallmem_mmap(size_t file_len) {
+    ioctl_MM_CREATE_t value;  // ioctl 创建映射命令结构
+    
+    // ===== 第1步：打开 recallmem 驱动设备（首次调用） =====
+    if(_fd < 0) {
+        _fd = open(recallmem_file_path, O_RDWR);
+        if(_fd < 0) {
+            check(0, "open recallmem ioctl device failed");
+            return nullptr;
+        }
+        // printf("[recallmem]: opened recallmem ioctl device: %s\n", recallmem_file_path);
+    }
+    
+    // 匿名映射模式
+    // printf("[recallmem]: no file_path provided, using anonymous mmap\n");
+    file_len = (file_len + 4096 - 1) / 4096 * 4096;  // 对齐到页边界
+    value.req.model_path[0] = '\0';  // 空字符串表示匿名映射
+    value.req.len = file_len;         // 显式指定映射大小
+
+    
+    // 调用 ioctl 创建匿名映射
+    if(ioctl(_fd, IOCTL_MM_CREATE, &value) < 0) {
+        // printf("[recallmem]: ioctl failed");
+        return nullptr;
+    }
+
+    
+    // ===== 第3步：保存映射信息到 maps 表 =====
+    struct MapOps* ops = new struct MapOps();
+    ops->fp =  std::string("");  // 保存文件路径
+    ops->va = value.ret.va;             // 保存 VA
+    ops->len = value.ret.len;           // 保存长度
+    ops->handle = value.ret.handle;     // 保存 handle（驱动返回的标识符）
+    printf("[recallmem]: mapped on %lx - %lx\n", ops->va, ops->va + ops->len);
+
+    // 检查地址是否页对齐
+    check_op(((uint64_t)ops->va) % PAGE_SIZE, ==, 0, "addr is not aligned");
+    return ops;
+}
+
+
+inline std::tuple<void*, uint64_t, uint64_t, uint64_t> mem_allocate(size_t size, uint32_t flags,
+                   uint64_t domain_id) {
+
+    int ret;
+    struct rknpu_mem_create mem_create = {};
+    // printf("Enter mem_allocate: size %zu, flags 0x%x, domain_id %u\n", size, flags, domain_id);
+
+    mem_create.flags = RKNPU_MEM_NON_CACHEABLE | RKNPU_MEM_KERNEL_MAPPING;
+    mem_create.size = size;
+    mem_create.iommu_domain_id = domain_id;
+
+    ret = ioctl(g_npu_fd, DRM_IOCTL_RKNPU_MEM_CREATE, &mem_create);
+    if (ret < 0) {
+        printf("RKNPU_MEM_CREATE failed %d\n", ret);
+        return std::make_tuple(nullptr, 0ULL, 0ULL, 0ULL);
+    }
+    // printf("mem_allocate rknpu_mem_create done, dma 0x%llx, size 0x%lx, domain_id: %x\n", 
+    //                                     mem_create.dma_addr, (uint64_t)mem_create.size, mem_create.iommu_domain_id);
+    
+
+    struct rknpu_mem_map mem_map = {.handle = mem_create.handle, .reserved = 0, .offset = 0};
+    ret = ioctl(g_npu_fd, DRM_IOCTL_RKNPU_MEM_MAP, &mem_map);
+    if (ret < 0) {
+        printf("RKNPU_MEM_MAP failed %d\n", ret);
+        return std::make_tuple(nullptr, 0ULL, 0ULL, 0ULL);
+    }
+
+    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, g_npu_fd, mem_map.offset);
+
+    // TODO: Fix these undefined variables (dma_addr, obj, handle)
+    // *dma_addr = mem_create.dma_addr;
+    // *obj = mem_create.obj_addr;
+    // *handle = mem_create.handle;
+    return std::make_tuple(map, mem_create.obj_addr, mem_create.dma_addr, mem_create.handle);
+}

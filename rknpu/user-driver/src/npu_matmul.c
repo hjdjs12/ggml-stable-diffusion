@@ -355,7 +355,7 @@ int gen_matmul_fp16(matmul_params_t *params) {
  *
  */
 int gen_matmul_int8(matmul_params_t *params) {
-
+    printf("Generating matmul task with M=%d, K=%d, N=%d\n", params->m, params->k, params->n);
     npu_cna_desc cna_desc;
     npu_core_desc core_desc;
     npu_dpu_desc dpu_desc;
@@ -393,12 +393,16 @@ int gen_matmul_int8(matmul_params_t *params) {
     fd_banks = ((fd_bytes % NPU_CBUF_BANK_SIZE) == 0) ? fd_banks : fd_banks + 1;
     weight_banks = (cna_desc.weight_bytes / NPU_CBUF_BANK_SIZE);
     weight_banks = ((cna_desc.weight_bytes % NPU_CBUF_BANK_SIZE) == 0) ? weight_banks : weight_banks + 1;
+    printf("before compare\n");
     if ((fd_banks) > NPU_CBUF_BANKS - 1) {
+        printf("fd_banks %d exceed cbuf bank limit\n", fd_banks);
         return -1;
     } else {
         if (cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE) {
+            printf("weight_banks %d, fd_banks %d\n", weight_banks, fd_banks);
             weight_banks = NPU_CBUF_BANKS - fd_banks;
         } else {
+            printf("weight_banks %d exceed cbuf bank limit\n", weight_banks);
             return -2;
         }
     }
@@ -473,7 +477,7 @@ int gen_matmul_int8(matmul_params_t *params) {
     dpu_desc.height_wdma = core_desc.dataout_height;
     dpu_desc.channel_wdma = core_desc.dataout_channel;
     dpu_desc.surf_add = dpu_desc.dst_surf_stride * 8;
-
+    printf("before gen_matmul_task\n");
     gen_matmul_task(params->tasks, &cna_desc, &core_desc, &dpu_desc);
 
     return 0;

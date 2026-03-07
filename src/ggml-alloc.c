@@ -12,6 +12,11 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MAX_FREE_BLOCKS 256
 
+// Page size for alignment (4KB)
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
+
 //#define GGML_ALLOCATOR_DEBUG
 
 //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
@@ -80,15 +85,37 @@ enum ggml_status ggml_tallocr_alloc(struct ggml_tallocr * talloc, struct ggml_te
     size_t size = ggml_backend_buffer_get_alloc_size(talloc->buffer, tensor);
     size = GGML_PAD(size, talloc->alignment);
 
-    if (talloc->offset + size > ggml_backend_buffer_get_size(talloc->buffer)) {
+    void * base = ggml_backend_buffer_get_base(talloc->buffer);
+    
+    // ✅ Calculate offset to make (base + offset) page-aligned
+    // Current address would be: base + talloc->offset
+    uintptr_t current_addr = (uintptr_t)base + talloc->offset;
+    
+    // Align to next page boundary (PAGE_SIZE is always >= alignment for typical cases)
+    uintptr_t page_aligned_addr = GGML_PAD(current_addr, PAGE_SIZE);
+    
+    // Ensure it also satisfies the buffer's alignment requirement
+    // Since PAGE_SIZE (4096) is usually a multiple of common alignments (16, 32, 64, 128, 256),
+    // page alignment typically implies smaller alignments. But let's be safe:
+    size_t combined_align = (PAGE_SIZE > talloc->alignment) ? PAGE_SIZE : 
+                            (talloc->alignment > PAGE_SIZE) ? talloc->alignment : PAGE_SIZE;
+    page_aligned_addr = GGML_PAD(current_addr, combined_align);
+    
+    // Calculate the new offset from base
+    size_t page_aligned_offset = page_aligned_addr - (uintptr_t)base;
+    
+    if (page_aligned_offset + size > ggml_backend_buffer_get_size(talloc->buffer)) {
         GGML_LOG_ERROR("%s: not enough space in the buffer to allocate %s (needed %zu, available %zu)\n",
-                __func__, tensor->name, size, ggml_backend_buffer_get_size(talloc->buffer) - talloc->offset);
+                __func__, tensor->name, size, ggml_backend_buffer_get_size(talloc->buffer) - page_aligned_offset);
         GGML_ABORT("not enough space in the buffer");
     }
 
-    void * addr = (char *)ggml_backend_buffer_get_base(talloc->buffer) + talloc->offset;
-    talloc->offset += size;
+    void * addr = (char *)base + page_aligned_offset;
+    // Pad the total allocation size to ensure next allocation starts at page boundary
+    talloc->offset = GGML_PAD(page_aligned_offset + size, combined_align);
 
+    // Verify page alignment
+    assert(((uintptr_t)addr % PAGE_SIZE) == 0);
     assert(((uintptr_t)addr % talloc->alignment) == 0);
 
     return ggml_backend_tensor_alloc(talloc->buffer, tensor, addr);
@@ -1175,6 +1202,10 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
     size_t alignment = ggml_backend_buft_get_alignment(buft);
     size_t max_size = ggml_backend_buft_get_max_size(buft);
 
+    // ✅ Use PAGE_SIZE alignment if it's larger than buffer alignment
+    // to account for page-aligned allocation in ggml_tallocr_alloc
+    size_t effective_alignment = (PAGE_SIZE > alignment) ? PAGE_SIZE : alignment;
+
     ggml_backend_buffer_t * buffers = NULL;
     size_t n_buffers = 0;
     *nbytes_total = 0;
@@ -1184,7 +1215,9 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
     for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         size_t this_size = 0;
         if (t->data == NULL && t->view_src == NULL) {
-            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+            // ✅ Add PAGE_SIZE margin for address alignment overhead in ggml_tallocr_alloc
+            // Each tensor may need up to PAGE_SIZE-1 bytes of pre-padding to align its address
+            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), effective_alignment) + PAGE_SIZE;
         }
 
         if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {

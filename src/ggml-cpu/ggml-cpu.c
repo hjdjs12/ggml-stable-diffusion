@@ -1237,13 +1237,23 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src1 = dst->src[1];
 
 #ifdef GGML_USE_NPU
-    // 尝试使用 NPU 加速
-    printf("ggml_compute_forward_mul_mat: trying to use NPU acceleration\n");
-    if (g_npu_available && params->ith == 0) {
-        if (ggml_can_use_npu(src0, src1)) {
+    // NPU 模式：只使用单线程执行，其他线程直接返回
+    if (g_npu_available && ggml_can_use_npu(src0, src1)) {
+        if (params->ith == 0) {
+            // 线程 0：使用 NPU 执行
+            printf("ggml_compute_forward_mul_mat: [thread 0] Using NPU (single thread mode)\n");
             ggml_compute_forward_mul_mat_npu(params, dst);
+            printf("ggml_compute_forward_mul_mat: [thread 0] NPU completed\n");
+            return;
+        } else {
+            // 其他线程：直接返回，不做任何事
+            printf("ggml_compute_forward_mul_mat: [thread %d] NPU mode - skipping worker thread\n", params->ith);
             return;
         }
+    }
+    // 如果不使用 NPU，所有线程继续执行 CPU 多线程代码
+    if (params->ith == 0) {
+        printf("ggml_compute_forward_mul_mat: [thread 0] Using CPU (multi-thread mode), nth=%d\n", params->nth);
     }
 #endif
 
