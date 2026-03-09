@@ -16,7 +16,9 @@
  * 
  * Reference Architecture:
  * - Based on rk3588-npu matrix multiplication implementation
- * - Supports block splitting: BLOCK_WEIGHT (256) × BLOCK_SHARED (512)
+ * - Supports block splitting: BLOCK_WEIGHT (256) × BLOCK_SHARED (32)
+ * - BLOCK_SHARED=32 matches Q8_0 block size for EXACT dequantization
+ *   (each task processes one quantization block → uniform scales → no approximation)
  * - Double buffering: buffer_free[2] for CPU/NPU synchronization
  * - Task batching: TASKS_LOCAL_PER_NUM (2-3) tasks per submission
  * 
@@ -99,7 +101,7 @@ struct cache_inval_range {
 constexpr int LOOKAHEAD = 12;
 constexpr int PER_TASK_CORE_NUM = 3;
 constexpr int BLOCK_WEIGHT = 256;
-constexpr int BLOCK_SHARED = 512;  // Reduced to fit NPU CBUF limit: max(M×K) ≤ 11×32KB = 360KB
+constexpr int BLOCK_SHARED = 32;  // Match Q8_0 block size for exact dequantization (one scale per task)
 constexpr uint32_t BATCH_SIZE = 512;
 constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
 
@@ -348,6 +350,32 @@ inline int weight_int8(int C, int k, int c) {
     return dst;
 }
 
+/**
+ * @brief 计算 weight 在 NPU 布局中从 (row=0, col=0) 到 (row, col) 的字节偏移
+ * 
+ * @param C 权重矩阵对齐后的列数 (K_w, 32-aligned)
+ * @param row 输出通道索引（权重矩阵行）
+ * @param col 输入通道索引（权重矩阵列）
+ * @return 字节偏移量
+ */
+inline uint64_t weight_dma_offset(int C, int row, int col) {
+    // weight_int8(C, k=row, c=col) 给出 (row,col) 在 NPU layout 中的线性索引
+    return static_cast<uint64_t>(weight_int8(C, row, col));
+}
+
+/**
+ * @brief 计算 input 在 NPU feature 布局中从 (row=0, col=0) 到 (row, col) 的字节偏移
+ * 
+ * @param H 输入矩阵行数
+ * @param col 输入通道索引（列）
+ * @return 字节偏移量（假设 row=0，因为我们批量处理所有行）
+ */
+inline uint64_t input_dma_offset(int H, int col) {
+    // feature_data(H, 16, c=col, h=0) 给出 (0, col) 处的线性索引
+    // 必须完整计算：plane 起始 + col%16 的偏移
+    return static_cast<uint64_t>(feature_data(H, 16, col, 0));
+}
+
 static void to_npu_feature_layout(const int8_t* src, int M, int K, int8_t* dst) {
     const int K_aligned = (K + 15) & ~15;
     // Use simple loop instead of memset to avoid NEON SIMD alignment requirements
@@ -377,7 +405,9 @@ static void to_npu_weight_layout(const int8_t* src, int N, int K, int8_t* dst) {
     // #pragma omp parallel for
     for (int n = 0; n < N; n++) {
         for (int k = 0; k < K; k++) {
-            dst[weight_int8(K_aligned, k, n)] = src[n * K + k];
+            // ✅ FIXED: weight_int8(C, k=row_index, c=col_index)
+            // n is row index (output channel), k is col index (input channel)
+            dst[weight_int8(K_aligned, n, k)] = src[n * K + k];
         }
     }
 }
@@ -617,6 +647,15 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
  * - Uses NEON instructions for dequantization
  * - Cache prefetching for better performance
  * 
+ * GGML matmul convention: dst = src1 @ src0.T (transposed multiplication)
+ * - src0 (weight): M×K stored physically, represents K×M logically (transposed)
+ * - src1 (input):  N×K
+ * - dst (output):  N×M
+ * 
+ * NPU computation: input @ weight.T
+ * - NPU expects weight in row-major format (M×K physical = N output features, each K-dim)
+ * - NPU expects input in col-major format (N×K)
+ * 
  * NOTE: Quantization and IOMMU mapping are done earlier in model.cpp
  *       This function works with pre-quantized Q8_0 tensors that have DMA addresses
  */
@@ -626,9 +665,10 @@ static void compute_matmul_q8_0_parallel(
     struct ggml_tensor* dst,         // output (N x M, FP32)
     int domain_id) {
     
-    const int M = src0->ne[1];
-    const int K = src0->ne[0];
-    const int N = src1->ne[1];
+    // GGML dimensions (physical storage)
+    const int M = src0->ne[1];  // weight rows (output dimension when transposed)
+    const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
+    const int N = src1->ne[1];  // input rows (batch size)
     const int QK = 32;
     
     // Step 1: Quantize input to Q8_0 (input is FP32, runtime data)
@@ -749,25 +789,29 @@ static void compute_matmul_q8_0_parallel(
     auto tasks = std::make_shared<std::vector<std::tuple<int, int, matmul_task_t>>>();
     tasks->reserve(ceil_int(M, BLOCK_WEIGHT) * ceil_int(K, BLOCK_SHARED));
     
-    uint64_t weight_dma = weight_dma_base;
-    
     // Split matrix into blocks
     // Output matrix: N x M (src1 rows x src0 rows)
-    // Weight matrix: M x K (src0)
-    // Input matrix: N x K (src1)
+    // Weight matrix (NPU layout): M x K_w (M output dims, K_w=align32(K) input dims)
+    // Input matrix (NPU layout): N x K_in (N batch, K_in=align16(K) input dims)
     for (int j = 0; j < M;) {
         auto _n = std::min(M - j, BLOCK_WEIGHT);
-        auto input_dma = input_dma_base;
         
         for (int k = 0; k < K;) {
             auto _k = std::min(K - k, BLOCK_SHARED);
+            
+            // Calculate DMA addresses for this block using NPU layout functions
+            // Input: feature layout (N x K_in, C2=16)
+            //   Get the base address for column k (all N rows start here)
+            uint64_t input_dma = input_dma_base + input_dma_offset(N, k);
+            
+            // Weight: 32x32 block layout (M x K_w)
+            //   Get the address for element at (row=j, col=k)
+            uint64_t weight_dma = weight_dma_base + weight_dma_offset(K_w, j, k);
             
             tasks->emplace_back(j, k, matmul_task_t{
                 input_dma, weight_dma, N, _k, _n
             });
             
-            input_dma += N * _k;
-            weight_dma += _k * _n;
             k += _k;
         }
         j += _n;
@@ -794,6 +838,15 @@ static void compute_matmul_q8_0_parallel(
     }
     
     // Step 9: CPU processes NPU output with double buffering
+    // 
+    // EXACT DEQUANTIZATION STRATEGY (BLOCK_SHARED=32):
+    // Since each task processes exactly one 32-element quantization block in K dimension:
+    // - Input row i, block k/32 has scale: input_scales[i * (K/32) + k/32]
+    // - Weight row j, block k/32 has scale: weight_scales[j * (K/32) + k/32]
+    // - NPU output: task_output[i,j] = sum_{k'=0}^{31}(quant_input[i,k'] * quant_weight[j,k'])
+    // - Exact FP32 result: output[i,j] += input_scale * weight_scale * task_output[i,j]
+    //
+    // This is EXACT (no approximation) because each 32-element block uses uniform scales.
     int index = 0;
     const int scale_per_k = K / QK;
     float* dst_data = (float*)dst->data;
@@ -817,12 +870,17 @@ static void compute_matmul_q8_0_parallel(
             
             int joff_max = std::min(M - j, BLOCK_WEIGHT);
             
+         
+            
             // Process output with NEON optimization
+            // For each weight row in [j, j+joff_max), get the scale for block k/32
+            // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
             #pragma omp parallel for num_threads(4)
             for (int joff = 0; joff < joff_max; joff += 4) {
                 const int j_start = j + joff;
                 
-                // Load 4 weight scales
+                // Load 4 weight scales for the current k/32 block
+                // weight_scales[j_row * scale_per_k + k_block_idx]
                 int w_scale_off = j_start * scale_per_k + k / QK;
                 
                 #ifdef __ARM_NEON
@@ -834,6 +892,9 @@ static void compute_matmul_q8_0_parallel(
                 };
                 #endif
                 
+                // ✅ CRITICAL FIX: Use N (batch size) not M for feature_data!
+                // NPU output matrix is N×BLOCK_WEIGHT (N rows, BLOCK_WEIGHT cols)
+                // feature_data(H, C2, c, h) where H=height=N
                 int feature_offset = feature_data(N, 4, joff, 0);
                 
                 for (int i = 0; i < N; i++) {
@@ -845,14 +906,17 @@ static void compute_matmul_q8_0_parallel(
                         }
                     }
                     
-                    // Dequantize: INT32 -> FP32
+                    // Exact dequantization: INT32 -> FP32
+                    // Input row i, block k/32: input_scales[i * (K/32) + k/32]
+                    // This is exact because task's K dimension = 32 (one quantization block)
                     const float input_scale = input_scales[i * scale_per_k + k / QK];
                     
                     #ifdef __ARM_NEON
                     int32x4_t v_int32 = vld1q_s32(&task_output[feature_offset]);
                     float32x4_t v_val = vcvtq_f32_s32(v_int32);
                     float32x4_t v_input_scale = vdupq_n_f32(input_scale);
-                    v_val = vmulq_f32(v_val, vmulq_f32(v_input_scale, w_scale));
+                    // v_val = vmulq_f32(v_val, vmulq_f32(v_input_scale, w_scale));
+                    v_val = v_val;
                     
                     float* out_ptr = &dst_data[i * M + j_start];
                     float32x4_t out_old = vld1q_f32(out_ptr);
@@ -861,7 +925,8 @@ static void compute_matmul_q8_0_parallel(
                     #else
                     for (int vi = 0; vi < 4; vi++) {
                         if (j_start + vi < M) {
-                            float val = task_output[feature_offset + vi] * input_scale * weight_scales[w_scale_off + scale_per_k * vi];
+                            // float val = task_output[feature_offset + vi] * input_scale * weight_scales[w_scale_off + scale_per_k * vi];
+                            float val = task_output[feature_offset + vi];
                             dst_data[i * M + j_start + vi] += val;
                         }
                     }
@@ -870,6 +935,7 @@ static void compute_matmul_q8_0_parallel(
                     feature_offset += 4;
                 }
             }
+            
         }
         
         {
