@@ -1279,7 +1279,7 @@ void ggml_compute_forward_mul_mat(
             printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
             float* result = (float*)dst->data;
             size_t total_elements = dst->ne[0] * dst->ne[1];
-            size_t print_count = total_elements < 64 ? total_elements : 64;
+            size_t print_count = total_elements ;
             for (size_t i = 0; i < print_count; i++) {
                 printf("%.6f ", result[i]);
                 if ((i + 1) % 8 == 0) printf("\n  ");
@@ -1517,7 +1517,8 @@ UseGgmlGemm2:;
         printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
         float* result = (float*)dst->data;
         size_t total_elements = dst->ne[0] * dst->ne[1];
-        size_t print_count = total_elements < 64 ? total_elements : 64;
+        printf("TOTAL ELEMENT %d \n" , total_elements);
+        size_t print_count = total_elements ;
         for (size_t i = 0; i < print_count; i++) {
             printf("%.6f ", result[i]);
             if ((i + 1) % 8 == 0) printf("\n  ");

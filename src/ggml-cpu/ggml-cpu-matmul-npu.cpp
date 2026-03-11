@@ -35,7 +35,7 @@
  * - NPU submission is PLACEHOLDER (rknpu_matmul returns dummy data)
  * - Requires full driver/hardware support to actually execute on NPU
  */
-
+#include <inttypes.h>
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -109,7 +109,7 @@ constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
 struct matmul_task_t {
     uint64_t input_dma;
     uint64_t weight_dma;
-    int M, K, N;
+    int M, K, N;//这里的M是输入的，和后面不同，N是权重的
 };
 
 struct rknpu_tasks_t {
@@ -124,7 +124,7 @@ static std::vector<std::shared_ptr<std::vector<std::tuple<int, int, matmul_task_
 static std::shared_ptr<std::vector<int32_t*>> npu_tasks_shared;
 
 // Double buffering control
-static int TASKS_LOCAL_PER_NUM = 2;
+static int TASKS_LOCAL_PER_NUM = 3;
 static std::atomic<int> buffer_free[2];
 static int npu_domain_id = 0;
 
@@ -350,6 +350,16 @@ inline int weight_int8(int C, int k, int c) {
     return dst;
 }
 
+inline int weight_int8_another(int M, int k, int m) {
+    int kpg = (k / 32);          // 输出通道块索引（每 32 个输出通道为一块）
+    int mpg = (m / 32);          // 输入通道块索引（每 32 个输入通道为一块）
+    // 计算块起始偏移
+    int dst = ((mpg * 32) * 32) + (kpg * 32 * M);
+    // 计算块内偏移（列优先存储）
+    dst = dst + (m % 32) + ((k % 32) * 32);
+    return dst;
+}
+
 /**
  * @brief 计算 weight 在 NPU 布局中从 (row=0, col=0) 到 (row, col) 的字节偏移
  * 
@@ -393,21 +403,21 @@ static void to_npu_feature_layout(const int8_t* src, int M, int K, int8_t* dst) 
     }
 }
 
-static void to_npu_weight_layout(const int8_t* src, int N, int K, int8_t* dst) {
+static void to_npu_weight_layout(const int8_t* src, int M, int K, int8_t* dst) {
     const int K_aligned = (K + 31) & ~31;
     // Use simple loop instead of memset to avoid NEON SIMD alignment requirements
     // (IOMMU memory may not satisfy alignment needed by optimized memset)
-    for (size_t i = 0; i < N * K_aligned; i++) {
+    for (size_t i = 0; i < M * K_aligned; i++) {
         dst[i] = 0;
     }
     
     // TEMPORARY FIX: Disable OpenMP
     // #pragma omp parallel for
-    for (int n = 0; n < N; n++) {
-        for (int k = 0; k < K; k++) {
+    for (int k = 0; k < K; k++) {
+        for (int m = 0; m < M; m++) {
             // ✅ FIXED: weight_int8(C, k=row_index, c=col_index)
             // n is row index (output channel), k is col index (input channel)
-            dst[weight_int8(K_aligned, n, k)] = src[n * K + k];
+            dst[weight_int8(K, m, k)] = src[m * K + k];
         }
     }
 }
@@ -562,7 +572,6 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
         // 计算每个任务的输出偏移：假设每个任务最多输出 m*n 个 int32_t
         size_t per_task_output_size = m * n;  // 每个任务最大输出元素数
         uint64_t task_output_dma = output_dma + (t + output_index) * per_task_output_size * sizeof(int32_t);
-        
         update_matmul_addr(reg_va, tsk.input_dma, tsk.weight_dma, task_output_dma);
         
         // ✅ 填充任务描述符（rknpu_task 结构）
@@ -632,9 +641,153 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
         // size_t buffer_size = per_task_output_size * sizeof(int32_t);
         // invalid_cache(result.output[t], buffer_size);
     }
+    // ===== 第3步：返回 NPU 输出指针并打印结果 =====
     return result;  // 返回结果
 }
 
+
+
+
+
+// 根据 DMA 地址在当前 Domain 中反查 CPU 虚拟地址
+static void* find_va_by_dma(Domain* domain, uint64_t dma_addr) {
+    if (!domain) return nullptr;
+
+    // 1. 检查是否在 Input 缓冲区 (LeftMemory)
+    if (domain->input && dma_addr >= domain->input->iommu_addr && 
+        dma_addr < domain->input->iommu_addr + domain->input->size) {
+        return (uint8_t*)domain->input->virtual_addr + (dma_addr - domain->input->iommu_addr);
+    }
+
+    // 2. 检查是否在 Output 缓冲区 (LeftMemory)
+    if (domain->output && dma_addr >= domain->output->iommu_addr && 
+        dma_addr < domain->output->iommu_addr + domain->output->size) {
+        return (uint8_t*)domain->output->virtual_addr + (dma_addr - domain->output->iommu_addr);
+    }
+
+    // 3. 检查模型权重 (tensors map)
+    // 对应 Domain 里的：std::map<std::string, std::tuple<ggml_tensor*, TensorStorage*, IommuConfig*>> tensors;
+    for (auto const& [name, info] : domain->tensors) {
+        IommuConfig* cfg = std::get<2>(info);
+        if (cfg && dma_addr >= cfg->iommu_addr && dma_addr < cfg->iommu_addr + WEIGHT_SIZE) { // WEIGHT_SIZE 作为上限安全检查
+            // IommuConfig 本身不存 VA，但我们可以通过绑定的 ggml_tensor 获取
+            ggml_tensor* t = std::get<0>(info);
+            if (t && t->data) {
+                return (uint8_t*)t->data + (dma_addr - cfg->iommu_addr);
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+
+// static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0, int output_index = 0) {
+//     rknpu_tasks_result_t result = {};
+//     Domain* domain = find_domain_by_id(domain_id);
+//     if (!domain) return result;
+
+//     // 基础地址准备
+//     uint8_t* regcmd_va = static_cast<uint8_t*>(domain->regcmd->virtual_addr);
+//     uint64_t regcmd_dma = domain->regcmd->iommu_addr;
+//     rknpu_task* tasks_va = static_cast<rknpu_task*>(domain->tasks_mem->virtual_addr);
+//     uint64_t tasks_obj = domain->tasks_mem->obj_addr;
+//     int32_t* output_va = static_cast<int32_t*>(domain->output->virtual_addr);
+//     uint64_t output_dma = domain->output->iommu_addr;
+
+//     uint64_t off = 0;
+//     int task_num = 0;
+
+//     // --- 提交前：打印输入与权重 ---
+//     for (int t = 0; t < PER_TASK_CORE_NUM && tasks.tasks[t].input_dma; t++) {
+//         auto &tsk = tasks.tasks[t];
+        
+//         // // 打印输入数据快照 (4x4)
+//         // int8_t* in_ptr = (int8_t*)find_va_by_dma(domain, tsk.input_dma);
+//         // if (in_ptr) {
+//         //     printf("\n[NPU-DEBUG] Task %d | In-DMA: 0x%" PRIx64 " | Input Matrix (4x4):\n", t, (uint64_t)tsk.input_dma);
+//         //     for (int m = 0; m < tsk.M ; m++) {
+//         //         for (int k = 0; k < tsk.K; k++) {
+//         //             printf("%4d ", (int)in_ptr[feature_data(tsk.M, 16, k, m)]);
+//         //         }
+//         //         printf("\n");
+//         //     }
+//         // }
+
+//         // // 打印权重数据快照 (4x4)
+//         // int8_t* w_ptr = (int8_t*)find_va_by_dma(domain, tsk.weight_dma);
+//         // if (w_ptr) {
+//         //     printf("[NPU-DEBUG] Task %d | Wt-DMA: 0x%" PRIx64 " | Weight Matrix (4x4):\n", t, (uint64_t)w_ptr);
+//         //     int K_aligned = (tsk.K + 31) & ~31;
+//         //     for (int n = 0; n < tsk.N; n++) {
+//         //         for (int k = 0; k <  tsk.K; k++) {
+//         //             printf("%4d ", (int)w_ptr[weight_int8(tsk.K, n, k)]);
+//         //         }
+//         //         printf("\n");
+//         //     }
+//         // }
+
+//         // 构造寄存器指令
+//         uint64_t* reg_va = reinterpret_cast<uint64_t*>(regcmd_va + off);
+//         matmul_params_t params = {(uint16_t)tsk.M, (uint16_t)tsk.K, (uint16_t)tsk.N, reg_va};
+//         gen_matmul_int8(&params);
+        
+//         uint64_t task_output_dma = output_dma + (uint64_t)(t + output_index) * tsk.M * tsk.N * sizeof(int32_t);
+//         update_matmul_addr(reg_va, tsk.input_dma, tsk.weight_dma, task_output_dma);
+
+//         tasks_va[t].regcmd_addr = regcmd_dma + off;
+//         tasks_va[t].regcfg_amount = TASK_REG_AMOUNT;
+//         tasks_va[t].enable_mask = 0xd;
+//         tasks_va[t].int_mask = 0x300;
+//         tasks_va[t].int_clear = 0x1ffff;
+
+//         off += NPU_REGS_SIZE * sizeof(uint64_t);
+//         task_num++;
+//     }
+
+//     if (task_num == 0) return result;
+
+//     flush_cache((void*)tasks_va, sizeof(rknpu_task) * PER_TASK_CORE_NUM);
+//     flush_cache((void*)regcmd_va, off);
+
+//     // --- 硬件提交 (兼容非 C++20 标准) ---
+//     struct rknpu_submit submit;
+//     memset(&submit, 0, sizeof(submit));
+//     submit.flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG;
+//     submit.timeout = 6000;
+//     submit.task_number = 1;
+//     submit.task_obj_addr = tasks_obj;
+//     submit.iommu_domain_id = (uint32_t)domain_id;
+//     submit.core_mask = (uint32_t)((task_num >= 1) | ((task_num >= 2) << 1) | ((task_num >= 3) << 2));
+    
+//     for(int i=0; i<3; i++) {
+//         submit.subcore_task[i].task_start = (uint32_t)i;
+//         submit.subcore_task[i].task_number = (uint32_t)(task_num > i);
+//     }
+
+//     rknpu_ioctl(DRM_IOCTL_RKNPU_SUBMIT, &submit, domain_id);
+
+//     // --- 提交后：打印输出结果 ---
+//     for (int t = 0; t < task_num; t++) {
+//         auto &tsk = tasks.tasks[t];
+//         result.output[t] = output_va + (t + output_index) * (tsk.M * tsk.N);
+        
+//         // 失效 Cache，确保 CPU 读取的是 NPU 写入 DDR 的新数据
+//         invalid_cache(result.output[t], tsk.M * tsk.N * sizeof(int32_t));
+
+//         // printf("\n[NPU-DEBUG] Task %d | Out-DMA: 0x%" PRIx64 " | Output Raw INT32 (4x4):\n", 
+//         //        t, (uint64_t)(output_dma + (t + output_index) * tsk.M * tsk.N * sizeof(int32_t)));
+//         // for (int i = 0; i < tsk.M; i++) {
+//         //     for (int j = 0; j < tsk.N; j++) {
+//         //         // 输出通常遵循 C4 格式排布
+//         //         printf("%8d ", result.output[t][feature_data(tsk.M, 4, j, i)]);
+//         //     }
+//         //     printf("\n");
+//         // }
+//     }
+
+//     return result;
+// }
 // ============================================================================
 // Q8_0 Path: Parallel matmul with double buffering
 // ============================================================================
@@ -696,7 +849,7 @@ static void compute_matmul_q8_0_parallel(
     const int K_in = (K + 15) & ~15;
     const int K_w = (K + 31) & ~31;
     
-    std::vector<int8_t> input_npu(N * K_in);
+    std::vector<int8_t> input_npu(N * K_in, 0);
     to_npu_feature_layout(input_int8.data(), N, K, input_npu.data());
     
     // NOTE: weight_npu will be created in-place at src0->data later (Step 4)
@@ -793,38 +946,29 @@ static void compute_matmul_q8_0_parallel(
     // Output matrix: N x M (src1 rows x src0 rows)
     // Weight matrix (NPU layout): M x K_w (M output dims, K_w=align32(K) input dims)
     // Input matrix (NPU layout): N x K_in (N batch, K_in=align16(K) input dims)
-    for (int j = 0; j < M;) {
-        auto _n = std::min(M - j, BLOCK_WEIGHT);
-        
-        for (int k = 0; k < K;) {
-            auto _k = std::min(K - k, BLOCK_SHARED);
+    for (int j = 0; j < M; j += BLOCK_WEIGHT) {
+        int _n = std::min(M - j, BLOCK_WEIGHT);
+        for (int k = 0; k < K; k += BLOCK_SHARED) {
+            int _k = std::min(K - k, BLOCK_SHARED);
             
-            // Calculate DMA addresses for this block using NPU layout functions
-            // Input: feature layout (N x K_in, C2=16)
-            //   Get the base address for column k (all N rows start here)
-            uint64_t input_dma = input_dma_base + input_dma_offset(N, k);
-            
-            // Weight: 32x32 block layout (M x K_w)
-            //   Get the address for element at (row=j, col=k)
-            uint64_t weight_dma = weight_dma_base + weight_dma_offset(K_w, j, k);
-            
+
             tasks->emplace_back(j, k, matmul_task_t{
-                input_dma, weight_dma, N, _k, _n
+                input_dma_base, weight_dma_base, N, _k, _n
             });
-            
-            k += _k;
+            input_dma_base += N * _k;
+            weight_dma_base += _k * _n;
         }
-        j += _n;
+        input_dma_base = input_domain->input->iommu_addr;
     }
     
     // Step 6: Adjust batch size based on task count
-    if (tasks->size() <= PER_TASK_CORE_NUM) {
-        TASKS_LOCAL_PER_NUM = PER_TASK_CORE_NUM;
-    } else if (tasks->size() > 2 * PER_TASK_CORE_NUM + 1) {
-        TASKS_LOCAL_PER_NUM = PER_TASK_CORE_NUM;
-    } else {
-        TASKS_LOCAL_PER_NUM = 2;
-    }
+    // if (tasks->size() <= PER_TASK_CORE_NUM) {
+    //     TASKS_LOCAL_PER_NUM = PER_TASK_CORE_NUM;
+    // } else if (tasks->size() > 2 * PER_TASK_CORE_NUM + 1) {
+    //     TASKS_LOCAL_PER_NUM = PER_TASK_CORE_NUM;
+    // } else {
+    //     TASKS_LOCAL_PER_NUM = 2;
+    // }
     
     // Step 7: Initialize output to zero
     std::fill((float*)dst->data, (float*)dst->data + N * M, 0.0f);
@@ -868,74 +1012,36 @@ static void compute_matmul_q8_0_parallel(
             // Invalidate cache to ensure CPU reads NPU-written data
             invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT) * sizeof(int32_t));
             
-            int joff_max = std::min(M - j, BLOCK_WEIGHT);
+            int current_m_task = std::min(M - j, BLOCK_WEIGHT);
             
          
             
             // Process output with NEON optimization
             // For each weight row in [j, j+joff_max), get the scale for block k/32
             // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
-            #pragma omp parallel for num_threads(4)
-            for (int joff = 0; joff < joff_max; joff += 4) {
-                const int j_start = j + joff;
-                
-                // Load 4 weight scales for the current k/32 block
-                // weight_scales[j_row * scale_per_k + k_block_idx]
-                int w_scale_off = j_start * scale_per_k + k / QK;
-                
-                #ifdef __ARM_NEON
-                float32x4_t w_scale = {
-                    weight_scales[w_scale_off], 
-                    weight_scales[w_scale_off + scale_per_k * 1],
-                    weight_scales[w_scale_off + scale_per_k * 2],
-                    weight_scales[w_scale_off + scale_per_k * 3]
-                };
-                #endif
-                
-                // ✅ CRITICAL FIX: Use N (batch size) not M for feature_data!
-                // NPU output matrix is N×BLOCK_WEIGHT (N rows, BLOCK_WEIGHT cols)
-                // feature_data(H, C2, c, h) where H=height=N
-                int feature_offset = feature_data(N, 4, joff, 0);
-                
-                for (int i = 0; i < N; i++) {
-                    // Cache prefetch optimization
-                    if (i + LOOKAHEAD < N) {
-                        __builtin_prefetch(&dst_data[(i + LOOKAHEAD) * M + j_start], 1, 3);
-                        if ((i % 4) == 0) {
-                            __builtin_prefetch(&task_output[feature_offset + (LOOKAHEAD * 4)], 0, 3);
-                        }
+            for (int i = 0; i < N; i++) { // 行遍历 (Height)
+                auto cur_block_start = j * K + k * BLOCK_WEIGHT;//当前任务处理的第一个元素在 weight矩阵中的偏移
+                auto actual_start_m = cur_block_start / K ; //编号从0开始，真正的结果起始行
+                auto max_num_per_m = K / 32;
+                auto cur_num_per_m = cur_block_start % K / 32 ;//编号从0开始，真正的结果起始列
+                auto cur_actual_m = actual_start_m;
+                // std::cout << "cur_task print j:" << j << "  k:"<< k << std::endl;
+                for (int joff = 0; joff < current_m_task; joff ++) { 
+
+                    auto cur_offset_in_result = i * M + cur_actual_m ;
+                    // std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[feature_data(N, 4, joff, i)] << std::endl;
+                    dst_data[cur_offset_in_result] += (float)task_output[feature_data(N, 4, joff, i)] ;
+                    cur_num_per_m ++;
+                    cur_actual_m++;
+                    if(cur_num_per_m == K){
+                        cur_num_per_m = 0;
+                        actual_start_m += 32;
+                        cur_actual_m = actual_start_m;
+                    }else if(cur_num_per_m != 0 && cur_num_per_m % 32 == 0){
+                        cur_actual_m = actual_start_m;
                     }
-                    
-                    // Exact dequantization: INT32 -> FP32
-                    // Input row i, block k/32: input_scales[i * (K/32) + k/32]
-                    // This is exact because task's K dimension = 32 (one quantization block)
-                    const float input_scale = input_scales[i * scale_per_k + k / QK];
-                    
-                    #ifdef __ARM_NEON
-                    int32x4_t v_int32 = vld1q_s32(&task_output[feature_offset]);
-                    float32x4_t v_val = vcvtq_f32_s32(v_int32);
-                    float32x4_t v_input_scale = vdupq_n_f32(input_scale);
-                    // v_val = vmulq_f32(v_val, vmulq_f32(v_input_scale, w_scale));
-                    v_val = v_val;
-                    
-                    float* out_ptr = &dst_data[i * M + j_start];
-                    float32x4_t out_old = vld1q_f32(out_ptr);
-                    out_old = vaddq_f32(out_old, v_val);
-                    vst1q_f32(out_ptr, out_old);
-                    #else
-                    for (int vi = 0; vi < 4; vi++) {
-                        if (j_start + vi < M) {
-                            // float val = task_output[feature_offset + vi] * input_scale * weight_scales[w_scale_off + scale_per_k * vi];
-                            float val = task_output[feature_offset + vi];
-                            dst_data[i * M + j_start + vi] += val;
-                        }
-                    }
-                    #endif
-                    
-                    feature_offset += 4;
                 }
             }
-            
         }
         
         {
@@ -949,6 +1055,239 @@ static void compute_matmul_q8_0_parallel(
     npu_tasks_shared.reset();
 }
 
+static void compute_matmul_q8_0_parallel_DEBUG(
+    const struct ggml_tensor* src0,  // 仅保留维度信息
+    const struct ggml_tensor* src1,  // 仅保留维度信息
+    struct ggml_tensor* dst,         
+    int domain_id) {
+    
+    // GGML dimensions
+    // const int M = src0->ne[1];  权重
+    // const int K = src0->ne[0];  
+    // const int N = src1->ne[1];  输入
+    const int M = 4096;  
+    const int K = 64;  
+    const int N = 256;  
+    
+const int QK = 32;
+const int num_k_blocks = K / QK;
+
+// 1. 模拟输入 (N x K): 每个 QK 分块的第一个元素设为 (i + 1)
+std::vector<int8_t> input_int8(N * K, 0); 
+for (int i = 0; i < N; ++i) {
+    for (int k = 0; k < K; ++k) {
+        // 每个元素的值 = (行号 + 1) + (在该块内的偏移)
+        // 这样 Row 0, Block 0 是 1, 2, 3...32
+        // Row 0, Block 1 也是 1, 2, 3...32
+        input_int8[i * K + k] = (int8_t)((i + 1) + (k % QK));
+    }
+}
+std::vector<float> input_scales(N * K / QK, 1.0f);
+
+// 2. 模拟权重 (M x K): 每个 QK 分块的第一个元素设为 (j + 1)
+std::vector<int8_t> weight_int8(M * K, 0);
+for (int j = 0; j < M; ++j) {
+    for (int k = 0; k < K; ++k) {
+        // 为了和输入区分，权重只跟行号 j 有关
+        // 这样每一行是一个常数，方便心算验证
+        weight_int8[j * K + k] = (int8_t)((j % 10) + 1); 
+    }
+}
+
+
+printf("Logging input_int8 full matrix (%d x %d):\n", N, K);
+
+for (int j = 0; j < N; ++j) {
+    for (int k = 0; k < K; ++k) {
+        // 强制转换为 int 以显示数值，空格分隔
+        printf("%d ", (int)input_int8[j * K + k]);
+    }
+    // 每一行换行
+    printf("\n");
+}
+
+
+printf("Logging weight_int8 full matrix (%d x %d):\n", M, K);
+
+for (int j = 0; j < M; ++j) {
+    for (int k = 0; k < K; ++k) {
+        // 强制转换为 int 以显示数值，空格分隔
+        printf("%d ", (int)weight_int8[j * K + k]);
+    }
+    // 每一行换行
+    printf("\n");
+}
+printf("--- End of Matrix ---\n");
+std::vector<float> weight_scales(M * K / QK, 1.0f);
+
+/* 预期结果校验：
+- dst[row=0, col=0] = 1 * 1 = 1
+- dst[row=0, col=1] = 1 * 2 = 2
+- dst[row=1, col=0] = 2 * 1 = 2
+- dst[row=1, col=1] = 2 * 2 = 4
+- dst[i, j] = (i + 1) * (j + 1)
+*/
+
+// --- DEBUG 结束 ---
+
+    // --- DEBUG 替换结束 ---
+
+    // Step 3: 转换到 NPU 布局 (保持原样)
+    const int K_in = (K + 15) & ~15;
+    const int K_w = (K + 31) & ~31;
+    
+    std::vector<int8_t> input_npu(N * K_in, 0); // 填充0防止对齐位干扰
+    to_npu_feature_layout(input_int8.data(), N, K, input_npu.data());
+    
+    // Step 4: 处理 IOMMU 映射 (由于是 Debug，我们直接操作映射内存)
+    Domain* weight_domain = find_tensor_domain(src0);
+    uint64_t weight_dma_base = 0;
+    
+    if (weight_domain && src0->name) {
+        auto it = weight_domain->tensors.find(std::string(src0->name));
+        if (it != weight_domain->tensors.end()) {
+            IommuConfig* iommu_config = std::get<2>(it->second);
+            if (iommu_config && iommu_config->iommu_addr) {
+                // 直接将我们构造的简单权重写入 IOMMU 映射区
+                to_npu_weight_layout(weight_int8.data(), M, K, (int8_t*)src0->data);
+                weight_dma_base = iommu_config->iommu_addr;
+                flush_cache(src0->data, M * K_w);
+            }
+        }
+    }
+
+    printf("after npu_weight translate:\n");
+    int8_t* ptr = (int8_t*)src0->data;
+    const int K_aligned = (K + 31) & ~31;
+    for (int j = 0; j < M; ++j) {
+        for (int k = 0; k < K; ++k) {
+            // 强制转换为 int 以显示数值，空格分隔
+            printf("%d ", (int)ptr[j * K + k]);
+        }
+        // 每一行换行
+        printf("\n");
+    }
+    printf("--- End of Matrix ---\n");
+    // printf("Logging weight_int8 full matrix (%d x %d):\n", M, K);
+    // for (int j = 0; j < M; ++j) {
+    //     for (int k = 0; k < K; ++k) {
+    //         // 强制转换为 int 以显示数值，空格分隔
+    //         printf("%d ", (int)weight_int8[j * K + k]);
+    //     }
+    //     // 每一行换行
+    //     printf("\n");
+    // }
+    // printf("--- End of Matrix ---\n");
+
+    // 处理输入 Buffer (DMA)
+    Domain* input_domain = find_domain_by_id(domain_id);
+    if (!input_domain || !input_domain->input) {
+        throw std::runtime_error("Debug Input IOMMU buffer not available");
+    }
+    
+    memcpy(input_domain->input->virtual_addr, input_npu.data(), N * K_in);
+    flush_cache(input_domain->input->virtual_addr, N * K_in);
+    uint64_t input_dma_base = input_domain->input->iommu_addr;
+
+    printf("[NPU-DEBUG] w-src-data: 0x%" PRIx64 " \n", (uint64_t)src0->data);
+    // Step 5: 构建 Task 列表 (保持原样)
+    auto tasks = std::make_shared<std::vector<std::tuple<int, int, matmul_task_t>>>();
+    for (int j = 0; j < M; j += BLOCK_WEIGHT) {
+        int _n = std::min(M - j, BLOCK_WEIGHT);
+        for (int k = 0; k < K; k += BLOCK_SHARED) {
+            int _k = std::min(K - k, BLOCK_SHARED);
+            
+
+            tasks->emplace_back(j, k, matmul_task_t{
+                input_dma_base, weight_dma_base, N, _k, _n
+            });
+            input_dma_base += N * _k;
+            weight_dma_base += _k * _n;
+        }
+        input_dma_base = input_domain->input->iommu_addr;
+    }
+
+    // Step 7: 初始化输出
+    std::fill((float*)dst->data, (float*)dst->data + N * M, 0.0f);
+
+    // Step 8: 提交 (保持原样)
+    {
+        std::lock_guard<std::mutex> lock(npu_worker_mtx);
+        tasks_list.push_back(tasks);
+        npu_domain_id = domain_id;
+        npu_cv.notify_one();
+    }
+
+// ============================================================================
+// Step 9: CPU 处理反量化 (最终修正版 - 解决 32 通道对齐与寻址问题)
+// ============================================================================
+int index = 0;
+const int scale_per_k = K / QK; // 4096 / 32 = 128
+float* dst_data = (float*)dst->data;
+
+int total_blocks = (M / BLOCK_WEIGHT) * (K / BLOCK_SHARED);
+int result_step = M / total_blocks;
+for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
+    {
+        std::unique_lock<std::mutex> lock(cpu_worker_mtx);
+        cpu_cv.wait(lock, [&] { 
+            return npu_tasks_shared.use_count() != 0 && 
+                   npu_tasks_shared->at(t) != nullptr && 
+                   buffer_free[index].load(std::memory_order_acquire) == 1;
+        });
+    }
+
+    for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
+        const auto [j, k, task] = tasks->at(t + toff);
+        int32_t* task_output = npu_tasks_shared->at(t + toff);
+        
+        // 获取当前任务处理的列数 (M 方向)
+        int current_m_task = std::min(M - j, BLOCK_WEIGHT);
+        
+        // 1. 确保读取前失效整个任务输出区域的 Cache
+        // N 是高度 (H)，current_m_task 是总通道数 (C)
+        invalid_cache(task_output, N * current_m_task * sizeof(int32_t));
+        // auto cur_block_start = j * K + k * current_m_task;//当前任务处理的第一个元素在 weight矩阵中的偏移
+        // auto actual_start_m = cur_block_start / K ; //编号从0开始，真正的结果起始行
+        // auto max_num_per_m = K / 32;
+        // auto cur_num_per_m = cur_block_start % K / 32 ;//编号从0开始，真正的结果起始列
+        // auto cur_actual_m = actual_start_m;
+        // std::cout << "cur_task print j:" << j << "  k:"<< k << std::endl;
+        // #pragma omp parallel for num_threads(4)
+        for (int i = 0; i < N; i++) { // 行遍历 (Height)
+            auto cur_block_start = j * K + k * BLOCK_WEIGHT;//当前任务处理的第一个元素在 weight矩阵中的偏移
+            auto actual_start_m = cur_block_start / K ; //编号从0开始，真正的结果起始行
+            auto max_num_per_m = K / 32;
+            auto cur_num_per_m = cur_block_start % K / 32 ;//编号从0开始，真正的结果起始列
+            auto cur_actual_m = actual_start_m;
+            std::cout << "cur_task print j:" << j << "  k:"<< k << std::endl;
+            for (int joff = 0; joff < current_m_task; joff ++) { 
+
+                auto cur_offset_in_result = i * M + cur_actual_m ;
+                std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[feature_data(N, 4, joff, i)] << std::endl;
+                dst_data[cur_offset_in_result] += (float)task_output[feature_data(N, 4, joff, i)] ;
+                cur_num_per_m ++;
+                cur_actual_m++;
+                if(cur_num_per_m == K){
+                    cur_num_per_m = 0;
+                    actual_start_m += 32;
+                    cur_actual_m = actual_start_m;
+                }else if(cur_num_per_m != 0 && cur_num_per_m % 32 == 0){
+                    cur_actual_m = actual_start_m;
+                }
+            }
+        }
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(npu_worker_mtx);
+        buffer_free[index].store(0, std::memory_order_release);
+        npu_cv.notify_one();
+    }
+    index = (index + 1) & 0x1;
+}
+npu_tasks_shared.reset();
+}
 
 
 // ============================================================================
@@ -1010,7 +1349,7 @@ void ggml_compute_forward_mul_mat_npu(
     
     try {
         // All types converted to Q8_0 (NPU only supports INT8)
-        compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
+        compute_matmul_q8_0_parallel_DEBUG(src0, src1, dst, domain_id);
     } catch (const std::exception& e) {
         fprintf(stderr, "[NPU] Error: %s, falling back to CPU\n", e.what());
         // Let GGML handle CPU fallback by not writing to dst
