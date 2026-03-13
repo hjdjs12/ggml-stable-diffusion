@@ -1081,37 +1081,104 @@ printf("------------------------------------------------------------------------
             // Invalidate cache to ensure CPU reads NPU-written data
             invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT) * sizeof(int32_t));
             
-            int current_m_task = std::min(M - j, BLOCK_WEIGHT);
+            // int current_m_task = std::min(M - j, BLOCK_WEIGHT);
             
          
             
             // Process output with NEON optimization
             // For each weight row in [j, j+joff_max), get the scale for block k/32
             // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
-            for (int i = 0; i < N; i++) { // 行遍历 (Height)
-                int cur_block_start = j * K + k * BLOCK_WEIGHT;//当前任务处理的第一个元素在 weight矩阵中的偏移
-                int  actual_start_m = (cur_block_start / (32 * 32) / (K / BLOCK_SHARED)) * 32; //编号从0开始，真正的结果起始行
-                auto max_num_per_m = K / 32;
-                auto cur_num_per_m = (cur_block_start - actual_start_m * K ) / 32   ;//编号从0开始，真正的结果起始列
-                auto cur_actual_m = actual_start_m;
-                std::cout << "cur_task print j:" << j << "  k:"<< k << std::endl;
-                std::cout <<  "actual_start_m" << actual_start_m <<std::endl;
-                for (int joff = 0; joff < current_m_task; joff ++) { 
-                    std::cout << "current_m_task:"  << current_m_task << std::endl;
-                    auto cur_offset_in_result = i * M + cur_actual_m ;
-                    std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[feature_data(N, 4, joff, i)] << "i:" <<i << " cur_actual_m" << cur_actual_m <<std::endl;
-                    auto target = feature_data(N, 4, joff, i);
-                    std::cout << "target:" << target << std::endl;
-                    dst_data[cur_offset_in_result] += (float)task_output[target] ;
-                    cur_num_per_m ++;
-                    cur_actual_m++;
-                    if(cur_num_per_m == K){
-                        cur_num_per_m = 0;
-                        actual_start_m += 32;
-                        cur_actual_m = actual_start_m;
-                    }else if(cur_num_per_m != 0 && cur_num_per_m % 32 == 0){
-                        cur_actual_m = actual_start_m;
+            // for (int i = 0; i < N; i++) { // 行遍历 (Height)
+            //     int cur_block_start = j * K + k * BLOCK_WEIGHT;//当前任务处理的第一个元素在 weight矩阵中的偏移
+            //     int  actual_start_m = (cur_block_start / (32 * 32) / (K / BLOCK_SHARED)) * 32; //编号从0开始，真正的结果起始行
+            //     auto max_num_per_m = K / 32;
+            //     auto cur_num_per_m = (cur_block_start - actual_start_m * K ) / 32   ;//编号从0开始，真正的结果起始列
+            //     auto cur_actual_m = actual_start_m;
+            //     std::cout << "cur_task print j:" << j << "  k:"<< k << std::endl;
+            //     std::cout <<  "actual_start_m" << actual_start_m <<std::endl;
+            //     for (int joff = 0; joff < current_m_task; joff ++) { 
+            //         std::cout << "current_m_task:"  << current_m_task << std::endl;
+            //         auto cur_offset_in_result = i * M + cur_actual_m ;
+            //         std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[feature_data(N, 4, joff, i)] << "i:" <<i << " cur_actual_m" << cur_actual_m <<std::endl;
+            //         auto target = feature_data(N, 4, joff, i);
+            //         std::cout << "target:" << target << std::endl;
+            //         dst_data[cur_offset_in_result] += (float)task_output[target] ;
+            //         cur_num_per_m ++;
+            //         cur_actual_m++;
+            //         if(cur_num_per_m == K){
+            //             cur_num_per_m = 0;
+            //             actual_start_m += 32;
+            //             cur_actual_m = actual_start_m;
+            //         }else if(cur_num_per_m != 0 && cur_num_per_m % 32 == 0){
+            //             cur_actual_m = actual_start_m;
+            //         }
+            //     }
+            // }
+               int joff_max = std::min(M - j, BLOCK_WEIGHT);
+            
+         
+            
+            // Process output with NEON optimization
+            // For each weight row in [j, j+joff_max), get the scale for block k/32
+            // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
+            #pragma omp parallel for num_threads(4)
+            for (int joff = 0; joff < joff_max; joff += 4) {
+                const int j_start = j + joff;
+                
+                // Load 4 weight scales for the current k/32 block
+                // weight_scales[j_row * scale_per_k + k_block_idx]
+                int w_scale_off = j_start * scale_per_k + k / QK;
+                
+                #ifdef __ARM_NEON
+                float32x4_t w_scale = {
+                    weight_scales[w_scale_off], 
+                    weight_scales[w_scale_off + scale_per_k * 1],
+                    weight_scales[w_scale_off + scale_per_k * 2],
+                    weight_scales[w_scale_off + scale_per_k * 3]
+                };
+                #endif
+                
+                // ✅ CRITICAL FIX: Use N (batch size) not M for feature_data!
+                // NPU output matrix is N×BLOCK_WEIGHT (N rows, BLOCK_WEIGHT cols)
+                // feature_data(H, C2, c, h) where H=height=N
+                int feature_offset = feature_data(N, 4, joff, 0);
+                
+                for (int i = 0; i < N; i++) {
+                    // Cache prefetch optimization
+                    if (i + LOOKAHEAD < N) {
+                        __builtin_prefetch(&dst_data[(i + LOOKAHEAD) * M + j_start], 1, 3);
+                        if ((i % 4) == 0) {
+                            __builtin_prefetch(&task_output[feature_offset + (LOOKAHEAD * 4)], 0, 3);
+                        }
                     }
+                    
+                    // Exact dequantization: INT32 -> FP32
+                    // Input row i, block k/32: input_scales[i * (K/32) + k/32]
+                    // This is exact because task's K dimension = 32 (one quantization block)
+                    const float input_scale = input_scales[i * scale_per_k + k / QK];
+                    
+                    #ifdef __ARM_NEON
+                    int32x4_t v_int32 = vld1q_s32(&task_output[feature_offset]);
+                    float32x4_t v_val = vcvtq_f32_s32(v_int32);
+                    float32x4_t v_input_scale = vdupq_n_f32(input_scale);
+                    // v_val = vmulq_f32(v_val, vmulq_f32(v_input_scale, w_scale));
+                    v_val = v_val;
+                    
+                    float* out_ptr = &dst_data[i * M + j_start];
+                    float32x4_t out_old = vld1q_f32(out_ptr);
+                    out_old = vaddq_f32(out_old, v_val);
+                    vst1q_f32(out_ptr, out_old);
+                    #else
+                    for (int vi = 0; vi < 4; vi++) {
+                        if (j_start + vi < M) {
+                            // float val = task_output[feature_offset + vi] * input_scale * weight_scales[w_scale_off + scale_per_k * vi];
+                            float val = task_output[feature_offset + vi];
+                            dst_data[i * M + j_start + vi] += val;
+                        }
+                    }
+                    #endif
+                    
+                    feature_offset += 4;
                 }
             }
         }
