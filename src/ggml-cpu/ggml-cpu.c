@@ -1242,54 +1242,60 @@ void ggml_compute_forward_mul_mat(
 
 #ifdef GGML_USE_NPU
     // NPU 模式：只使用单线程执行，其他线程直接返回
-    if (g_npu_available && ggml_can_use_npu(src0, src1)) {
-        if (params->ith == 0) {
-            // 线程 0：使用 NPU 执行
-            int op_num = atomic_fetch_add(&g_matmul_counter, 1) + 1;
-            printf("\n[MATMUL #%d] Using NPU (single thread mode)\n", op_num);
-            printf("  src0 (weight): %s, shape=[%lld, %lld], type=%d\n", src0->name, src0->ne[0], src0->ne[1], src0->type);
-            printf("  src1 (input):  %s, shape=[%lld, %lld], type=%d\n", src1->name, src1->ne[0], src1->ne[1], src1->type);
-            printf("  dst (output):  %s, shape=[%lld, %lld], type=%d\n", dst->name, dst->ne[0], dst->ne[1], dst->type);
-            
-            // 打印 src1 (input) 的前 64 个值 (FP32)
-            printf("[MATMUL #%d] Input (src1, first 64 floats):\n  ", op_num);
-            float* input_data = (float*)src1->data;
-            size_t input_elements = src1->ne[0] * src1->ne[1];
-            size_t input_print_count = input_elements < 64 ? input_elements : 64;
-            for (size_t i = 0; i < input_print_count; i++) {
-                printf("%.6f ", input_data[i]);
-                if ((i + 1) % 8 == 0) printf("\n  ");
+    int ret = ggml_can_use_npu(src0, src1);
+    if (g_npu_available && ret) {
+        if(ret == 1){
+            if (params->ith == 0) {
+                // 线程 0：使用 NPU 执行
+                int op_num = atomic_fetch_add(&g_matmul_counter, 1) + 1;
+                printf("\n[MATMUL #%d] Using NPU (single thread mode)\n", op_num);
+                printf("  src0 (weight): %s, shape=[%lld, %lld], type=%d\n", src0->name, src0->ne[0], src0->ne[1], src0->type);
+                printf("  src1 (input):  %s, shape=[%lld, %lld], type=%d\n", src1->name, src1->ne[0], src1->ne[1], src1->type);
+                printf("  dst (output):  %s, shape=[%lld, %lld], type=%d\n", dst->name, dst->ne[0], dst->ne[1], dst->type);
+                
+                // 打印 src1 (input) 的前 64 个值 (FP32)
+                printf("[MATMUL #%d] Input (src1, first 64 floats):\n  ", op_num);
+                float* input_data = (float*)src1->data;
+                size_t input_elements = src1->ne[0] * src1->ne[1];
+                size_t input_print_count = input_elements < 64 ? input_elements : 64;
+                for (size_t i = 0; i < input_print_count; i++) {
+                    printf("%.6f ", input_data[i]);
+                    if ((i + 1) % 8 == 0) printf("\n  ");
+                }
+                printf("\n");
+                
+                // 打印 src0 (weight) 的前 64 个值 (可能是量化格式，只打印原始字节)
+                printf("[MATMUL #%d] Weight (src0, first 64 bytes, type=%d):\n  ", op_num, src0->type);
+                uint8_t* weight_data = (uint8_t*)src0->data;
+                size_t weight_bytes = ggml_nbytes(src0);
+                size_t weight_print_count = weight_bytes < 64 ? weight_bytes : 64;
+                for (size_t i = 0; i < weight_print_count; i++) {
+                    printf("%02x ", weight_data[i]);
+                    if ((i + 1) % 16 == 0) printf("\n  ");
+                }
+                printf("\n");
+                
+                ggml_compute_forward_mul_mat_npu(params, dst);
+                
+                // 打印 NPU 计算结果的前 64 个 float 值
+                printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
+                float* result = (float*)dst->data;
+                size_t total_elements = dst->ne[0] * dst->ne[1];
+                size_t print_count = total_elements < 128 ? total_elements : 128;
+                for (size_t i = 0; i < print_count; i++) {
+                    printf("%.6f ", result[i]);
+                    if ((i + 1) % 8 == 0) printf("\n  ");
+                }
+                printf("\n[MATMUL #%d] NPU completed\n\n", op_num);
+                return;
+            } else {
+                // 其他线程：直接返回，不做任何事
+                return;
             }
-            printf("\n");
-            
-            // 打印 src0 (weight) 的前 64 个值 (可能是量化格式，只打印原始字节)
-            printf("[MATMUL #%d] Weight (src0, first 64 bytes, type=%d):\n  ", op_num, src0->type);
-            uint8_t* weight_data = (uint8_t*)src0->data;
-            size_t weight_bytes = ggml_nbytes(src0);
-            size_t weight_print_count = weight_bytes < 64 ? weight_bytes : 64;
-            for (size_t i = 0; i < weight_print_count; i++) {
-                printf("%02x ", weight_data[i]);
-                if ((i + 1) % 16 == 0) printf("\n  ");
-            }
-            printf("\n");
-            
+        }else{
             ggml_compute_forward_mul_mat_npu(params, dst);
-            
-            // 打印 NPU 计算结果的前 64 个 float 值
-            printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
-            float* result = (float*)dst->data;
-            size_t total_elements = dst->ne[0] * dst->ne[1];
-            size_t print_count = total_elements < 128 ? total_elements : 128;
-            for (size_t i = 0; i < print_count; i++) {
-                printf("%.6f ", result[i]);
-                if ((i + 1) % 8 == 0) printf("\n  ");
-            }
-            printf("\n[MATMUL #%d] NPU completed\n\n", op_num);
-            return;
-        } else {
-            // 其他线程：直接返回，不做任何事
-            return;
         }
+       
     }
     // 如果不使用 NPU，所有线程继续执行 CPU 多线程代码
     if (params->ith == 0) {

@@ -32,11 +32,12 @@ typedef struct {
 
     uint64_t *tasks;
 
-    // uint8_t   fp32tofp16; this is useless in int8 matmul
+    uint8_t   fp32tofp16;
 } matmul_params_t;
 
 // int gen_matmul_fp16(matmul_params_t *params);
 int gen_matmul_int8(matmul_params_t *params);
+int gen_matmul_fp16(matmul_params_t *params);
 void update_matmul_addr(uint64_t *ops, uint32_t input, uint32_t weights, uint32_t output);
 
 int feature_data(int H, int C2, int c, int h);
