@@ -86,9 +86,10 @@ inline std::tuple<void*, uint64_t, uint64_t, uint64_t> mem_allocate(size_t size,
 class TensorInfo {
 public:
     uint64_t offset;
+    ggml_type dtype;
     uint64_t size;
-    TensorInfo() : offset(0), size(0) {}  // Default constructor
-    TensorInfo(uint64_t offset, uint64_t size) : offset(offset), size(size) {}
+    TensorInfo() : offset(0), dtype(GGML_TYPE_F32), size(0) {}  // Default constructor
+    TensorInfo(uint64_t offset, ggml_type dtype, uint64_t size) : offset(offset), dtype(dtype), size(size) {}
 };
 
 class LeftMemory {
@@ -170,35 +171,38 @@ public:
         }
         
         // 1. 销毁 IOMMU 映射
-        // if (iommu_addr != nullptr) {
-        //     struct rknpu_mem_destroy mem_destroy = {};
-        //     mem_destroy.dma_addr = reinterpret_cast<__u64>(iommu_addr);
-        //     mem_destroy.iommu_domain_id = domain_id;
+        if (iommu_addr != 0) {
+            // uint64_t va_itr = va + std::get<0>(itr);
+            // struct rknpu_mem_destroy destroy = {.handle = std::get<4>(itr), 
+            //         .page_num = uint32_t(std::get<1>(itr) / PAGE_SIZE), .usr_va = va_itr};
             
-        //     try {
-        //         rknpu_ioctl(DRM_IOCTL_RKNPU_MEM_DESTROY, &mem_destroy, domain_id);
-        //         std::cout << "[LeftMemory] IOMMU mapping destroyed for DMA=" << iommu_addr << std::endl;
-        //     } catch (const std::exception& e) {
-        //         std::cerr << "[LeftMemory] Warning: Failed to destroy IOMMU mapping: " 
-        //                   << e.what() << std::endl;
-        //     }
+            // rknpu_ioctl(DRM_IOCTL_RKNPU_MEM_DESTROY, &destroy, std::get<3>(itr));
+            struct rknpu_mem_destroy mem_destroy = {};
+            mem_destroy.handle = mem_obj_handle;
+            mem_destroy.page_num = uint32_t(size / PAGE_SIZE);
+            mem_destroy.usr_va = reinterpret_cast<__u64>(virtual_addr);
             
-        //     if (mem_obj_handle) {
-        //         delete mem_obj_handle;
-        //         mem_obj_handle = nullptr;
-        //     }
-        //     iommu_addr = nullptr;
-        // }
+            try {
+                rknpu_ioctl(DRM_IOCTL_RKNPU_MEM_DESTROY, &mem_destroy, domain_id);
+                std::cout << "[LeftMemory] IOMMU mapping destroyed for DMA=" << iommu_addr << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "[LeftMemory] Warning: Failed to destroy IOMMU mapping: " 
+                          << e.what() << std::endl;
+            }
+            
+            mem_obj_handle = 0;
+            iommu_addr = 0;
+        }
         
         // 2. 解锁和释放虚拟内存
-        // if (virtual_addr != nullptr) {
-        //     munlock(virtual_addr, size);
-        //     munmap(virtual_addr, size);
-        //     std::cout << "[LeftMemory] Freed " << size << " bytes at VA=" << virtual_addr << std::endl;
-        //     virtual_addr = nullptr;
-        // }
+        if (virtual_addr != nullptr) {
+            munlock(virtual_addr, size);
+            munmap(virtual_addr, size);
+            std::cout << "[LeftMemory] Freed " << size << " bytes at VA=" << virtual_addr << std::endl;
+            virtual_addr = nullptr;
+        }
         
-        // size = 0;
+        size = 0;
     }
     
     ~LeftMemory() {
@@ -326,7 +330,9 @@ inline IommuConfig * iommu_create_domain(void *virtual_addr, uint64_t domain_id,
     // 例如：offset=0x100, size=0x500 => aligned_size=0x1000 (4KB)
     //      offset=0, size=44564480 => aligned_size=44564480 (已对齐)
     size_t aligned_size = (page_offset + used_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    
+    std::cout << "[IOMMU] Creating domain for VA=" << virtual_addr 
+              << ", size=" << used_size << " bytes (aligned to " << aligned_size << " bytes)" 
+              << ", domain_id=" << domain_id << std::endl;
     struct rknpu_mem_create mem_create = {};
     mem_create.flags = RKNPU_MEM_ALLOCATED;
     

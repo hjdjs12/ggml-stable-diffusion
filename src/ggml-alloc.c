@@ -83,6 +83,7 @@ struct ggml_tallocr ggml_tallocr_new(ggml_backend_buffer_t buffer) {
 
 enum ggml_status ggml_tallocr_alloc(struct ggml_tallocr * talloc, struct ggml_tensor * tensor) {
     size_t size = ggml_backend_buffer_get_alloc_size(talloc->buffer, tensor);
+    printf("%s: allocating %s (%zu bytes)\n", __func__, tensor->name, size);
     size = GGML_PAD(size, talloc->alignment);
 
     void * base = ggml_backend_buffer_get_base(talloc->buffer);
@@ -1179,6 +1180,10 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
             } else if (t->buffer == NULL) {
                 status = ggml_backend_view_init(t);
             }
+            if (status == GGML_STATUS_SUCCESS) {
+                    printf("  [TENSOR_VA] Name: %-20s | VA: %p | End: %p\n", 
+                            t->name, t->data, (char*)t->data + ggml_nbytes(t));
+                }
         } else {
             if (t->view_src != NULL && t->buffer == NULL) {
                 // view of a pre-allocated tensor
@@ -1199,7 +1204,7 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
         struct ggml_context * ctx, ggml_backend_buffer_type_t buft, size_t * nbytes_total, bool no_alloc) {
     GGML_ASSERT(ggml_get_no_alloc(ctx) == true);
 
-    size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t alignment = PAGE_SIZE; // ggml_tallocr_alloc uses PAGE_SIZE alignment to ensure proper alignment for all tensor types
     size_t max_size = ggml_backend_buft_get_max_size(buft);
 
     // ✅ Use PAGE_SIZE alignment if it's larger than buffer alignment
@@ -1211,23 +1216,39 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
     *nbytes_total = 0;
 
     size_t cur_buf_size = 0;
+    size_t cur_buf_offset = 0; // 模拟分配器的“游标”位置
     struct ggml_tensor * first = ggml_get_first_tensor(ctx);
-    for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+   for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         size_t this_size = 0;
         if (t->data == NULL && t->view_src == NULL) {
-            // ✅ Add PAGE_SIZE margin for address alignment overhead in ggml_tallocr_alloc
-            // Each tensor may need up to PAGE_SIZE-1 bytes of pre-padding to align its address
-            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), effective_alignment) + PAGE_SIZE;
-        }
-
+            size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+            
+            // 确保每个 Tensor 申请的大小是对齐到 PAGE_SIZE 的
+            this_size = GGML_PAD(alloc_size, PAGE_SIZE); 
+            
+            // 重要：在当前 Buffer 结尾处也确保是对齐的，
+            // 模拟下一次分配开始前可能产生的地址空隙
+            printf("[DEBUG] Tensor: %-20s | RawSize: %10zu | PaddedSize: %10zu | Offset: %10zu\n", 
+                t->name, 
+                alloc_size, 
+                this_size, 
+                cur_buf_size);
+            cur_buf_size = GGML_PAD(cur_buf_size, PAGE_SIZE);
+            
+        } 
+        // 检查加入当前 Tensor 后是否超出最大 Buffer 限制
         if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
-            // allocate tensors in the current buffer
+            // 在分配前打印，确认最终传给 IOCTL 的 Buffer 大小
+            printf("DEBUG: Buffer Full! Allocating current range, Size: %zu (0x%zx)\n", cur_buf_size, cur_buf_size);
+            
             if (!no_alloc && !alloc_tensor_range(ctx, first, t, buft, cur_buf_size, &buffers, &n_buffers)) {
                 return NULL;
             }
-            first = t;
+            
+            // 重置状态
             *nbytes_total += cur_buf_size;
-            cur_buf_size = this_size;
+            first = t;
+            cur_buf_size = this_size; // 新 Buffer 的第一个 Tensor
         } else {
             cur_buf_size += this_size;
         }

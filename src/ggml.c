@@ -317,7 +317,7 @@ void * ggml_aligned_malloc(size_t size) {
 #if defined(__s390x__)
     const int alignment = 256;
 #else
-    const int alignment = 64;
+    const int alignment = 4096;
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)

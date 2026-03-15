@@ -123,7 +123,8 @@ static const char * ggml_backend_amx_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_amx_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+    size_t aligned_size = GGML_PAD(size, 4096);
+    void * data = ggml_aligned_malloc(aligned_size);
     if (data == NULL) {
         fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size);
         return NULL;
