@@ -40,9 +40,9 @@ int gen_matmul_int8(matmul_params_t *params);
 int gen_matmul_fp16(matmul_params_t *params);
 void update_matmul_addr(uint64_t *ops, uint32_t input, uint32_t weights, uint32_t output);
 
-int feature_data(int H, int C2, int c, int h);
-int weight_fp16(int C, int k, int c);
-int weight_int8(int C, int k, int c);
+// int feature_data(int H, int C2, int c, int h);
+// int weight_fp16(int C, int k, int c);
+// int weight_int8(int C, int k, int c);
 void panic(const char *s);
 
 #endif // NPU_MATMUL_H

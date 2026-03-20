@@ -1241,6 +1241,7 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src1 = dst->src[1];
 
 #ifdef GGML_USE_NPU
+    ggml_barrier(params->threadpool);
     // NPU 模式：只使用单线程执行，其他线程直接返回
     int ret = ggml_can_use_npu(src0, src1);
     if (g_npu_available && ret) {
@@ -1265,28 +1266,98 @@ void ggml_compute_forward_mul_mat(
                 printf("\n");
                 
                 // 打印 src0 (weight) 的前 64 个值 (可能是量化格式，只打印原始字节)
-                printf("[MATMUL #%d] Weight (src0, first 64 bytes, type=%d):\n  ", op_num, src0->type);
-                uint8_t* weight_data = (uint8_t*)src0->data;
-                size_t weight_bytes = ggml_nbytes(src0);
-                size_t weight_print_count = weight_bytes < 64 ? weight_bytes : 64;
-                for (size_t i = 0; i < weight_print_count; i++) {
-                    printf("%02x ", weight_data[i]);
-                    if ((i + 1) % 16 == 0) printf("\n  ");
+                printf("[MATMUL #%d] Weight (src0, Structured Print, type=%s) data_ptr: %p:\n", op_num, ggml_type_name(src0->type),(void*)src0->data);
+
+                if (src0->type == GGML_TYPE_Q8_0) {
+                    printf("[CPU OP] src0 Weight (first 64 bytes, type=Q8_0):\n  ");
+                    
+                    // 强制转换为原始字节指针，不使用 block_q8_0 结构体解析
+                    uint8_t* raw_ptr = (uint8_t*)src0->data;
+                    
+                    // 确定打印长度（取数据总量和 64 的较小值）
+                    size_t total_bytes = ggml_nbytes(src0);
+                    size_t print_len = total_bytes < 64 ? total_bytes : 64;
+
+                    for (size_t i = 0; i < print_len; i++) {
+                        // 以两位十六进制打印，并保持对齐
+                        printf("%02x ", raw_ptr[i]);
+                        
+                        // 每 16 个字节换一行，方便对比
+                        if ((i + 1) % 16 == 0 && i < print_len - 1) {
+                            printf("\n  ");
+                        }
+                    }
+                    printf("\n");
                 }
-                printf("\n");
+                
+                else if (src0->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * f16_data = (const ggml_fp16_t *)src0->data;
+                    size_t n_elements = ggml_nelements(src0);
+                    size_t print_count = n_elements < 64 ? n_elements : 64;
+
+                    printf("  Data (FP16 converted to FP32 for print):\n    ");
+                    for (size_t i = 0; i < print_count; i++) {
+                        // 使用 GGML 内置函数将 FP16 转换为 float 打印
+                        float val = ggml_fp16_to_fp32(f16_data[i]);
+                        printf("%8.4f ", val);
+                        
+                        if ((i + 1) % 8 == 0) printf("\n    ");
+                    }
+                    printf("\n");
+                }
+                else {
+                    // 其他不支持结构化打印的类型，回退到 Hex 打印
+                    printf("  [Note] Structured print not implemented for %s, falling back to Hex:\n    ", ggml_type_name(src0->type));
+                    uint8_t* raw = (uint8_t*)src0->data;
+                    size_t weight_bytes = ggml_nbytes(src0);
+                    size_t weight_print_count = weight_bytes < 64 ? weight_bytes : 64;
+                    for (size_t i = 0; i < weight_print_count; i++) {
+                        printf("%02x ", raw[i]);
+                        if ((i + 1) % 16 == 0) printf("\n    ");
+                    }
+                    printf("\n");
+                }
                 
                 ggml_compute_forward_mul_mat_npu(params, dst);
                 
                 // 打印 NPU 计算结果的前 64 个 float 值
-                printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
+                printf("\n[MATMUL #%d] DEBUG INFO:\n", op_num);
+                printf("  dst_tensor_ptr: %p\n", (void*)dst);
+                printf("  dst_data_ptr:   %p\n", (void*)dst->data);
+                printf("  dst_shape:      [%ld, %ld, %ld, %ld]\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+                printf("  dst_type:       %d\n", dst->type);
+
                 float* result = (float*)dst->data;
-                size_t total_elements = dst->ne[0] * dst->ne[1];
+                size_t total_elements = (size_t)dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
                 size_t print_count = total_elements < 128 ? total_elements : 128;
-                for (size_t i = 0; i < print_count; i++) {
-                    printf("%.6f ", result[i]);
-                    if ((i + 1) % 8 == 0) printf("\n  ");
+
+                // --- 2. 写入文件逻辑 ---
+                char filename[64];
+                snprintf(filename, sizeof(filename), "results/%d.txt", op_num);
+                FILE *f_out = fopen(filename, "w");
+
+                if (f_out) {
+                    for (size_t i = 0; i < total_elements; i++) {
+                        fprintf(f_out, "%.6f\n", result[i]); // 每个数字一行
+                    }
+                    fclose(f_out);
+                    printf("  [SAVE] All %zu elements saved to %s\n", total_elements, filename);
+                } else {
+                    printf("  [ERROR] Failed to open file %s for writing\n", filename);
                 }
-                printf("\n[MATMUL #%d] NPU completed\n\n", op_num);
+
+                // --- 3. 原有的控制台打印逻辑 ---
+                printf("  Output (dst, first %zu floats):\n", print_count);
+                for (size_t i = 0; i < print_count; i++) {
+                    if (i % 8 == 0) {
+                        printf("  [%p] : ", (void*)(result + i));
+                    }
+                    printf("%9.6f ", result[i]);
+                    if ((i + 1) % 8 == 0) {
+                        printf("\n");
+                    }
+                }
+                printf("--------------------------------------\n");
                 return;
             } else {
                 // 其他线程：直接返回，不做任何事
@@ -1295,7 +1366,7 @@ void ggml_compute_forward_mul_mat(
         }else{
             ggml_compute_forward_mul_mat_npu(params, dst);
         }
-       
+        ggml_barrier(params->threadpool);
     }
     // 如果不使用 NPU，所有线程继续执行 CPU 多线程代码
     if (params->ith == 0) {
@@ -1494,6 +1565,45 @@ UseGgmlGemm2:;
         int op_num = atomic_fetch_add(&g_matmul_counter, 1) + 1;
         printf("\n[MATMUL #%d] Using CPU (completed)\n", op_num);
         printf("  src0 (weight): %s, shape=[%lld, %lld], type=%d\n", src0->name, (long long)src0->ne[0], (long long)src0->ne[1], src0->type);
+        
+        struct ggml_tensor* cur = src0;
+        while (cur != NULL) {
+            // 1. 打印基础信息
+            printf("\n[DEBUG] Current Tensor: %-20s | Type: %d | Data: %p\n", 
+                cur->name, cur->type, cur->data);
+
+            // 2. 打印前 32 个元素 (仅限 FP32 类型且数据已分配)
+            if (cur->data != NULL) {
+                if (cur->type == GGML_TYPE_F32) {
+                    float * data_ptr = (float *)cur->data;
+                    printf("  Data (F32): ");
+                    for (int i = 0; i < 32; ++i) {
+                        // 防止溢出：如果 tensor 元素总数小于 32
+                        if (i < (int)ggml_nelements(cur)) {
+                            printf("%.4f ", data_ptr[i]);
+                        }
+                    }
+                    printf("\n");
+                } else {
+                    printf("  Data: [Non-F32 type, skipping data print]\n");
+                }
+            } else {
+                printf("  Data: [NULL - Not yet allocated]\n");
+            }
+
+            // 3. 沿链条向上追溯
+            if (cur->view_src != NULL) {
+                printf("  -> Moving up View Chain to: %s\n", cur->view_src->name);
+                cur = cur->view_src;
+            } else if (cur->src[0] != NULL) {
+                printf("  -> Moving up Op Source (src[0]) to: %s\n", cur->src[0]->name);
+                cur = cur->src[0];
+            } else {
+                printf("  -> Reached Root.\n");
+                break;
+            }
+        }
+        
         printf("  src1 (input):  %s, shape=[%lld, %lld], type=%d\n", src1->name, (long long)src1->ne[0], (long long)src1->ne[1], src1->type);
         printf("  dst (output):  %s, shape=[%lld, %lld], type=%d\n", dst->name, (long long)dst->ne[0], (long long)dst->ne[1], dst->type);
         
@@ -1510,27 +1620,72 @@ UseGgmlGemm2:;
         
         // 打印 src0 (weight) 的前 64 个值 (可能是量化格式，只打印原始字节)
         printf("[MATMUL #%d] Weight (src0, first 64 bytes, type=%d):\n  ", op_num, src0->type);
-        uint8_t* weight_data = (uint8_t*)src0->data;
-        size_t weight_bytes = ggml_nbytes(src0);
-        size_t weight_print_count = weight_bytes < 64 ? weight_bytes : 64;
-        for (size_t i = 0; i < weight_print_count; i++) {
-            printf("%02x ", weight_data[i]);
-            if ((i + 1) % 16 == 0) printf("\n  ");
+
+        void* data_ptr = src0->data;
+        size_t total_bytes = ggml_nbytes(src0);
+
+        if (src0->type == GGML_TYPE_F32) {
+            // 处理 FP32 情况
+            float* f32_ptr = (float*)data_ptr;
+            size_t count = (total_bytes / sizeof(float)) < 16 ? (total_bytes / sizeof(float)) : 16;
+            for (size_t i = 0; i < count; i++) {
+                printf("%.4f ", f32_ptr[i]);
+                if ((i + 1) % 4 == 0) printf("\n  ");
+            }
+        } 
+        else if (src0->type == GGML_TYPE_F16) {
+            // 处理 FP16 情况 (注意：C++ 需包含 ggml_fp16_to_fp32 进行转换打印)
+            ggml_fp16_t* f16_ptr = (ggml_fp16_t*)data_ptr;
+            size_t count = (total_bytes / sizeof(ggml_fp16_t)) < 16 ? (total_bytes / sizeof(ggml_fp16_t)) : 16;
+            for (size_t i = 0; i < count; i++) {
+                printf("%.4f ", ggml_fp16_to_fp32(f16_ptr[i]));
+                if ((i + 1) % 4 == 0) printf("\n  ");
+            }
+        } 
+        else {
+            // 对于量化类型 (Q4_0, Q8_0 等)，直接打印十六进制是最稳妥的，因为它们是块结构
+            uint8_t* u8_ptr = (uint8_t*)data_ptr;
+            size_t weight_print_count = total_bytes < 64 ? total_bytes : 64;
+            for (size_t i = 0; i < weight_print_count; i++) {
+                printf("%02x ", u8_ptr[i]);
+                if ((i + 1) % 16 == 0) printf("\n  ");
+            }
         }
         printf("\n");
         
-        // 打印 CPU 计算结果的前 64 个 float 值
+        // 2. 构造文件名
+        char filename[128];
+        snprintf(filename, sizeof(filename), "results/%d.txt", op_num);
+
+        // 3. 打开文件
+        FILE* fp = fopen(filename, "w");
+        if (fp) {
+            float* result = (float*)dst->data;
+            size_t total_elements = dst->ne[0] * dst->ne[1];
+
+            // 写入文件：每行一个数字
+            for (size_t i = 0; i < total_elements; i++) {
+                fprintf(fp, "%.6f\n", result[i]);
+            }
+            fclose(fp);
+            
+            printf("[MATMUL #%d] Results saved to %s (Total elements: %zu)\n", 
+                    op_num, filename, total_elements);
+        } else {
+            fprintf(stderr, "[MATMUL #%d] Error: Could not open file %s for writing\n", 
+                    op_num, filename);
+        }
+
+        // 4. 保持原来的控制台预览打印（前 64 个）
         printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
-        float* result = (float*)dst->data;
-        size_t total_elements = dst->ne[0] * dst->ne[1];
-        printf("TOTAL ELEMENT %d \n" , total_elements);
-        size_t print_count = total_elements ;
+        float* result_ptr = (float*)dst->data;
+        size_t print_count = (dst->ne[0] * dst->ne[1]) < 64 ? (dst->ne[0] * dst->ne[1]) : 64;
         for (size_t i = 0; i < print_count; i++) {
-            printf("%.6f ", result[i]);
+            printf("%.6f ", result_ptr[i]);
             if ((i + 1) % 8 == 0) printf("\n  ");
         }
         printf("\n[MATMUL #%d] CPU completed\n\n", op_num);
-    }
+        }
 }
 
 // ggml_compute_forward_mul_mat_id

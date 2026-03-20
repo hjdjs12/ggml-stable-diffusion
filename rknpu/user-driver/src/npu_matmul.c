@@ -300,7 +300,7 @@ int gen_matmul_fp16(matmul_params_t *params) {
    dpu_desc.conv_mode = direct_convolution;
    dpu_desc.output_mode = 0x2;
    dpu_desc.flying_mode = 0x0;
-   dpu_desc.out_precision = (params->fp32tofp16==0) ? precision_float32 : precision_float16;
+   dpu_desc.out_precision = precision_float32;
    dpu_desc.in_precision = precision_float16;
    dpu_desc.proc_precision = precision_float16;
 //    dpu_desc.dst_base_addr = params->output_dma;
@@ -485,29 +485,29 @@ int gen_matmul_int8(matmul_params_t *params) {
 
 // feature_data(M, 16, k, m) for input
 // feature_data(M, 4, n, m) for output
-int feature_data(int H, int C2, int c, int h) {
+// int feature_data(int H, int C2, int c, int h) {
 
-    int plane = c / C2;
-    int src = plane * H * C2;
-    int offset = c % C2;
-    int pos = src + C2 * h + offset;
-    return pos;
-}
+//     int plane = c / C2;
+//     int src = plane * H * C2;
+//     int offset = c % C2;
+//     int pos = src + C2 * h + offset;
+//     return pos;
+// }
 
-int weight_fp16(int C, int k, int c) {
-    int dst = 0;
-    int kpg = ((k - 1) / 16);
-    int cpg = ((c - 1) / 32);
-    dst = ((cpg * 32) * 16) + (kpg * 16 * C);
-    dst = dst + ((c - 1) % 32) + (((k - 1) % 16) * 32);
-    return dst;
-}
+// int weight_fp16(int C, int k, int c) {
+//     int dst = 0;
+//     int kpg = ((k - 1) / 16);
+//     int cpg = ((c - 1) / 32);
+//     dst = ((cpg * 32) * 16) + (kpg * 16 * C);
+//     dst = dst + ((c - 1) % 32) + (((k - 1) % 16) * 32);
+//     return dst;
+// }
 
-int weight_int8(int C, int k, int c) {
-    int dst = 0;
-    int kpg = (k / 32);
-    int cpg = (c / 32);
-    dst = ((cpg * 32) * 32) + (kpg * 32 * C);
-    dst = dst + (c % 32) + ((k % 32) * 32);
-    return dst;
-}
+// int weight_int8(int C, int k, int c) {
+//     int dst = 0;
+//     int kpg = (k / 32);
+//     int cpg = (c / 32);
+//     dst = ((cpg * 32) * 32) + (kpg * 32 * C);
+//     dst = dst + (c % 32) + ((k % 32) * 32);
+//     return dst;
+// }
