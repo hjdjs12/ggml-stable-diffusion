@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <errno.h>
+#include <arm_neon.h>
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -66,9 +67,157 @@ struct cache_inval_range {
 constexpr int LOOKAHEAD = 12;
 constexpr int PER_TASK_CORE_NUM = 3;
 constexpr int BLOCK_WEIGHT = 2048;
-constexpr int BLOCK_SHARED = 32;  // Match Q8_0 block size for exact dequantization (one scale per task)
+constexpr int BLOCK_SHARED = 512;  // Match Q8_0 block size for exact dequantization (one scale per task)
 constexpr uint32_t BATCH_SIZE = 512;
 constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
+
+
+
+float inline get_scale(uint16_t d_as_uint) {
+    // 实际实现中请替换为你框架的 fp16_to_fp32
+    return (float)d_as_uint; 
+}
+
+
+template <int N>
+struct block_q8_0_x {
+    uint16_t d;       // 缩放因子 (fp16)
+    int8_t  qs[N];    // 连续存储的 N 个 int8 权重
+};
+using block_q8_0_256 = block_q8_0_x<256>;
+using block_q8_0_512 = block_q8_0_x<512>;
+using block_q8_0_1024 = block_q8_0_x<1024>;
+
+// void convert_q8_32_to_256(const block_q8_0* src, block_q8_0_256* dst, int64_t n_elements) {
+//     const int group_ratio = 8; // 256 / 32
+//     int64_t n_new_blocks = n_elements / 256;
+
+//     for (int64_t i = 0; i < n_new_blocks; ++i) {
+//         float max_s = 0.0f;
+//         const block_q8_0* src_sub_group = &src[i * group_ratio];
+
+//         // 1. 寻找 8 个旧 block 中最大的 scale
+//         for (int j = 0; j < group_ratio; ++j) {
+//             float s = get_scale(src_sub_group[j].d);
+//             if (s > max_s) max_s = s;
+//         }
+
+//         dst[i].d = (uint16_t)max_s; // 设置新的共享 scale
+
+//         // 2. 重新量化 int8 权重
+//         for (int j = 0; j < group_ratio; ++j) {
+//             float old_s = get_scale(src_sub_group[j].d);
+//             float rescale_factor = (max_s > 0) ? (old_s / max_s) : 0.0f;
+
+//             for (int k = 0; k < 32; ++k) {
+//                 // 计算新的 int8 值：new_q = old_q * (old_scale / new_scale)
+//                 float rescaled_val = (float)src_sub_group[j].qs[k] * rescale_factor;
+                
+//                 // 四舍五入并截断到 int8 范围
+//                 int32_t q_new = (int32_t)std::round(rescaled_val);
+//                 dst[i].qs[j * 32 + k] = (int8_t)std::max(-128, std::min(127, q_new));
+//             }
+//         }
+//     }
+// }
+inline uint16_t float_to_half(float f) {
+    // 使用 ARM NEON 指令将单个 float32 转换为 float16
+    // vcvt_f16_f32 是 AArch64 标准指令
+    __fp16 f16 = (__fp16)f;
+    uint16_t res;
+    std::memcpy(&res, &f16, 2);
+    return res;
+}
+
+template <int NEW_G>
+void convert_q8_to_large_block(
+    const block_q8_0* src,
+    block_q8_0_x<NEW_G>* dst,
+    int64_t n_elements
+) {
+    static_assert(NEW_G % 32 == 0, "NEW_G must be a multiple of 32");
+
+    constexpr int group_ratio  = NEW_G / 32;
+    const int64_t n_new_blocks = n_elements / NEW_G;
+
+    for (int64_t i = 0; i < n_new_blocks; ++i) {
+        const block_q8_0* src_group = src + i * group_ratio;
+
+        // 1. 找最大 scale
+        float max_s = 0.0f;
+        for (int j = 0; j < group_ratio; ++j) {
+            float s = ggml_fp16_to_fp32(src_group[j].d);
+            if (s > max_s) max_s = s;
+        }
+
+        dst[i].d = float_to_half(max_s);
+
+        // 2. 重新量化
+        for (int j = 0; j < group_ratio; ++j) {
+            float old_s          = ggml_fp16_to_fp32(src_group[j].d);
+            float rescale_factor = (max_s > 0.0f) ? (old_s / max_s) : 0.0f;
+
+            for (int k = 0; k < 32; ++k) {
+                float   val   = (float)src_group[j].qs[k] * rescale_factor;
+                int32_t q_new = (int32_t)std::round(val);
+                dst[i].qs[j * 32 + k] = (int8_t)std::max(-128, std::min(127, q_new));
+            }
+        }
+    }
+}
+
+template <int N>
+void quantize_row_q8_0_custom(const float* src, block_q8_0_x<N>* dst, int64_t n) {
+    const int num_blocks = n / N;
+
+    for (int i = 0; i < num_blocks; ++i) {
+        float amax = 0.0f;
+        const float* x = src + i * N;
+
+        for (int j = 0; j < N; ++j) {
+            amax = std::max(amax, std::abs(x[j]));
+        }
+
+        const float d = amax / 127.0f;
+        dst[i].d = float_to_half(d);
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        for (int j = 0; j < N; ++j) {
+            int rounded = (int)std::lround(x[j] * id);
+            dst[i].qs[j] = (int8_t)std::max(-128, std::min(127, rounded));
+        }
+    }
+}
+
+template <int N>
+void extract_q8_0_custom(
+    const block_q8_0_x<N>* src,
+    int64_t n,
+    int8_t* dst_int8,
+    float* dst_scales
+) {
+    const int num_blocks = n / N;
+
+    for (int i = 0; i < num_blocks; ++i) {
+        dst_scales[i] = ggml_fp16_to_fp32(src[i].d);
+        std::memcpy(dst_int8 + i * N, src[i].qs, N);
+    }
+}
+template void quantize_row_q8_0_custom<256> (const float*, block_q8_0_x<256>*,  int64_t);
+template void quantize_row_q8_0_custom<512> (const float*, block_q8_0_x<512>*,  int64_t);
+template void quantize_row_q8_0_custom<1024>(const float*, block_q8_0_x<1024>*, int64_t);
+template void extract_q8_0_custom<256> (const block_q8_0_x<256>*, int64_t, int8_t*, float*);
+template void extract_q8_0_custom<512> (const block_q8_0_x<512>*, int64_t, int8_t*, float*);
+template void extract_q8_0_custom<1024>(const block_q8_0_x<1024>*, int64_t, int8_t*, float*);
+// 别名
+inline void convert_q8_to_256(const block_q8_0* src, block_q8_0_x<256>* dst, int64_t n)
+{ convert_q8_to_large_block<256>(src, dst, n); }
+
+inline void convert_q8_to_512(const block_q8_0* src, block_q8_0_x<512>* dst, int64_t n)
+{ convert_q8_to_large_block<512>(src, dst, n); }
+
+inline void convert_q8_to_1024(const block_q8_0* src, block_q8_0_x<1024>* dst, int64_t n)
+{ convert_q8_to_large_block<1024>(src, dst, n); }
 
 // Task queue
 struct matmul_task_t {
@@ -261,32 +410,52 @@ static void npu_work() {
  * @param int8_out   输出: INT8 数据（nrows × ncols）
  * @param scales_out 输出: scale 数组（nrows × nb，nb = ncols/32）
  */
-static void extract_q8_0(
-    const block_q8_0* blocks,
-    int nrows, int ncols,
-    int8_t* int8_out,
-    float* scales_out) {
+// static void extract_q8_0(
+//     const block_q8_0* blocks,
+//     int nrows, int ncols,
+//     int8_t* int8_out,
+//     float* scales_out) {
     
-    const int QK = 32;  // Q8_0 块大小
-    const int nb = ncols / QK;  // 每行的块数
+//     const int QK = 32;  // Q8_0 块大小
+//     const int nb = ncols / QK;  // 每行的块数
     
-    // 串行处理（避免 OpenMP 并行访问 mmap 内存的潜在问题）
-    for (int i = 0; i < nrows; i++) {
-        for (int j = 0; j < nb; j++) {
-            const block_q8_0& blk = blocks[i * nb + j];
+//     // 串行处理（避免 OpenMP 并行访问 mmap 内存的潜在问题）
+//     for (int i = 0; i < nrows; i++) {
+//         for (int j = 0; j < nb; j++) {
+//             const block_q8_0& blk = blocks[i * nb + j];
             
-            // 提取 scale（FP16 → FP32）
-            scales_out[i * nb + j] = GGML_FP16_TO_FP32(blk.d);
+//             // 提取 scale（FP16 → FP32）
+//             scales_out[i * nb + j] = GGML_FP16_TO_FP32(blk.d);
             
-            // 逐字节拷贝 INT8 数据（避免对齐问题）
-            int8_t* dst = int8_out + i * ncols + j * QK;
-            const int8_t* src = blk.qs;
-            for (int k = 0; k < QK; k++) {
-                dst[k] = src[k];
-            }
-        }
-    }
-}
+//             // 逐字节拷贝 INT8 数据（避免对齐问题）
+//             int8_t* dst = int8_out + i * ncols + j * QK;
+//             const int8_t* src = blk.qs;
+//             for (int k = 0; k < QK; k++) {
+//                 dst[k] = src[k];
+//             }
+//         }
+//     }
+// }
+
+// void extract_q8_0_custom_256(
+//     const block_q8_0_256* src, 
+//     int64_t n,                // 总元素个数 (N * K)
+//     int8_t* dst_int8,         // 存放 int8 权重的 buffer
+//     float* dst_scales         // 存放 fp32 scale 的 buffer
+// ) {
+//     const int group_size = 256;
+//     const int num_blocks = n / group_size;
+
+//     for (int i = 0; i < num_blocks; ++i) {
+//         // 1. 提取并转换 Scale (fp16 -> fp32)
+//         // 注意：这里需要你环境中的 fp16 转换函数，或者使用 ggml_fp16_to_fp32
+//         dst_scales[i] = ggml_fp16_to_fp32(src[i].d);
+
+//         // 2. 拷贝 int8 数据
+//         // 使用 memcpy 通常比逐个赋值快得多
+//         std::memcpy(dst_int8 + i * group_size, src[i].qs, group_size);
+//     }
+// }
 
 // ============================================================================
 // NPU Layout Conversion Functions
@@ -452,16 +621,6 @@ static void to_npu_weight_layout(const int8_t* src, int M, int K, int8_t* dst) {
         dst[i] = 0;
     }
     
-    // TEMPORARY FIX: Disable OpenMP
-    // #pragma omp parallel for
-    // for (int m = 0; m < M; m++) {
-    //     for (int k = 0; k < K; k++) {
-    //         // ✅ FIXED: weight_int8(C, k=row_index, c=col_index)
-    //         // n is row index (output channel), k is col index (input channel)
-    //         auto target = weight_int8(K, m, k);
-    //         dst[target] = src[m * K + k];
-    //     }
-    // }
     auto cur_dst = dst;
     for (int j = 0; j < M;) {
         int _m   = std::min((int)BLOCK_WEIGHT, M - j);
@@ -631,7 +790,7 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
         
         // ✅ 设置输入/权重/输出的 DMA 地址（替代 RegCmd::setupAddr）
         // 计算每个任务的输出偏移：假设每个任务最多输出 m*n 个 int32_t
-        size_t per_task_output_size = m * n;  // 每个任务最大输出元素数
+        size_t per_task_output_size = m * ((n < 4) ? 4 : n);  // 每个任务最大输出元素数
         uint64_t task_output_dma = output_dma + (t + output_index) * per_task_output_size * sizeof(int32_t);
         update_matmul_addr(reg_va, tsk.input_dma, tsk.weight_dma, task_output_dma);
         
@@ -686,14 +845,15 @@ static rknpu_tasks_result_t rknpu_matmul(rknpu_tasks_t tasks, int domain_id = 0,
                 {0, 0},
             },
     };
-
+    auto start_time = ggml_time_us();
     // 调用 ioctl 提交给 RKNPU 驱动（阻塞等待 NPU 完成）
     rknpu_ioctl(DRM_IOCTL_RKNPU_SUBMIT, &submit, domain_id);
-    
+    auto end_time = ggml_time_us();
+    std::cout << "[rknpu_matmul] NPU execution completed, time: " << (end_time - start_time) / 1000.0 << " ms" << std::endl;
     // ===== 第3步：返回 NPU 输出指针 =====
     for (int t = 0; t < task_num; t++) {
         auto &tsk = tasks.tasks[t];
-        size_t per_task_output_size = tsk.M * tsk.N;  // 每个任务输出元素数
+        size_t per_task_output_size = tsk.M * ((tsk.N < 4) ? 4 : tsk.N);  // 每个任务输出元素数
         
         // 计算输出指针：基地址 + 偏移
         result.output[t] = output_va + (t + output_index) * per_task_output_size;
@@ -894,9 +1054,9 @@ static void compute_matmul_fp16_parallel(
     int domain_id) {
     
 
-    // const int M = 2;  // weight rows (output dimension when transposed)
-    // const int K = 64;  // weight cols = input cols (shared dimension)
-    // const int N = 1536;  // input rows (batch size)
+    // const int M = 1536;  // weight rows (output dimension when transposed)
+    // const int K = 1536;  // weight cols = input cols (shared dimension)
+    // const int N = 1;  // input rows (batch size)
     // size_t src0_size = M * K * sizeof(ggml_fp16_t);
     // std::vector<ggml_fp16_t> weight_f16(M * K);
 
@@ -912,15 +1072,21 @@ static void compute_matmul_fp16_parallel(
     // // --- 2. 加载 Input (src1) ---
     // // 假设 src1 原始形状是 [K, N]，类型是 F16 (基于你之前的 dump 代码)
     // size_t src1_size = N * K * sizeof(ggml_fp16_t);
+    // size_t tmp_size = N * K * sizeof(float);  // 如果需要临时存储 FP32 版本
     // std::vector<ggml_fp16_t> input_fp16(N * K);
-
+    // std::vector<float> input_fp32(N * K);  // 如果需要转换为 FP32
     // FILE *f_i = fopen("/root/teacache_weight.bin", "rb");
     // if (f_i) {
-    //     fread(input_fp16.data(), 1, src1_size, f_i);
+    //     fread(input_fp32.data(), 1, tmp_size, f_i);
     //     fclose(f_i);
-    //     printf(">>> Loaded input: %zu bytes\n", src1_size);
+    //     printf(">>> Loaded input: %zu bytes\n", tmp_size);
     // } else {
     //     printf(">>> Error: Could not open teacache_input.bin\n");
+    // }
+    // if(src1->type == GGML_TYPE_F16){
+    //     memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
+    // }else{
+    //     ggml_cpu_fp32_to_fp16((const float*)input_fp32.data(), input_fp16.data(), N * K);
     // }
     // // --- 1. 打印 Weight (src0) 前 10 个元素 ---
     // if (!weight_f16.empty()) {
@@ -946,15 +1112,16 @@ static void compute_matmul_fp16_parallel(
     //     printf("\n");
     // }
     // GGML dimensions (physical storage)
+
     const int M = src0->ne[1];  // weight rows (output dimension when transposed)
     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
     const int N = src1->ne[1];  // input rows (batch size)
-    const int QK = 32;
+    const int QK = 512;
     
     
 
     std::vector<ggml_fp16_t> input_fp16(N * K, 0);
-    if(src0->type == GGML_TYPE_F16){
+    if(src1->type == GGML_TYPE_F16){
         memcpy(input_fp16.data(), src1->data, N * K * sizeof(ggml_fp16_t));
     }else{
         ggml_cpu_fp32_to_fp16((const float*)src1->data, input_fp16.data(), N * K);
@@ -1162,7 +1329,7 @@ static void compute_matmul_fp16_parallel(
                     // std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[target] << "i:" <<i << " cur_M" << cur_M <<std::endl;
                     // std::cout << "weight_scale_offset:" << weight_scale_offset << "    weight_scale:" << weight_scales[weight_scale_offset] << std::endl;
                     auto output = (float)task_output[target];
-                    std::cout << "cur_offset_in_result, target,  N , M , output: " << cur_offset_in_result << "," << target << "," <<  i << "," << joff << "," << output << std::endl; 
+                    // std::cout << "cur_offset_in_result, target,  N , M , output: " << cur_offset_in_result << "," << target << "," <<  i << "," << joff << "," << output << std::endl; 
                     dst_data[cur_offset_in_result] += output;
                 }
             }
@@ -1199,6 +1366,42 @@ static void compute_matmul_fp16_parallel(
  * NOTE: Quantization and IOMMU mapping are done earlier in model.cpp
  *       This function works with pre-quantized Q8_0 tensors that have DMA addresses
  */
+
+
+
+
+// // 适配 group_size=256 的量化函数
+// void quantize_row_q8_0_custom_256(const float* src, block_q8_0_256* dst, int64_t n) {
+//     const int group_size = 256;
+//     const int num_blocks = n / group_size;
+
+//     for (int i = 0; i < num_blocks; ++i) {
+//         float amax = 0.0f; // 绝对值最大值
+//         const float* x = src + i * group_size;
+
+//         // 1. 寻找该组的最大绝对值
+//         for (int j = 0; j < group_size; ++j) {
+//             amax = std::max(amax, std::abs(x[j]));
+//         }
+
+//         // 2. 计算缩放因子 (Scale)
+//         // Q8_0 对称量化公式：amax / 127
+//         const float d = amax / 127.0f;
+//         dst[i].d = float_to_half(d); 
+        
+//         const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+//         // 3. 执行量化转换
+//         for (int j = 0; j < group_size; ++j) {
+//             float val = x[j] * id;
+//             // 使用 std::lround 并 clamp 到 int8 范围
+//             int rounded = (int)std::lround(val);
+//             dst[i].qs[j] = (int8_t)std::max(-128, std::min(127, rounded));
+//         }
+//     }
+// }
+
+
 static void compute_matmul_q8_0_parallel(
     const struct ggml_tensor* src0,  // weight (M x K, Q8_0, pre-quantized with IOMMU)
     const struct ggml_tensor* src1,  // input (N x K, FP32)
@@ -1209,24 +1412,41 @@ static void compute_matmul_q8_0_parallel(
     const int M = src0->ne[1];  // weight rows (output dimension when transposed)
     const int K = src0->ne[0];  // weight cols = input cols (shared dimension)
     const int N = src1->ne[1];  // input rows (batch size)
-    const int QK = 32;
+    const int QK = 512;
     
+
+
     // Step 1: Quantize input to Q8_0 (input is FP32, runtime data)
-    std::vector<block_q8_0> input_q8((N * K) / QK);
-    quantize_row_q8_0_ref((const float*)src1->data, input_q8.data(), N * K);
+    // std::vector<block_q8_0> input_q8((N * K) / QK);
+    // quantize_row_q8_0_ref((const float*)src1->data, input_q8.data(), N * K);
+    auto start_time = ggml_time_us();
+
+    // Step 1: 使用自定义的 256 步长类型进行量化
+    std::vector<block_q8_0_512> input_q8((N * K) / QK);
+    if(src1->type == GGML_TYPE_F32){
+        quantize_row_q8_0_custom<QK>((const float*)src1->data, input_q8.data(), N * K);
+    }else{
+        fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to Q8_0, got type %d\n", src1->type);
+        throw std::runtime_error("input type not support!");
+    }
+    
     
     std::vector<int8_t> input_int8(N * K, 0);
     std::vector<float> input_scales(N * K / QK, 0);
-    extract_q8_0(input_q8.data(), N, K, input_int8.data(), input_scales.data());
-    
-    std::cout << "input_scale:" ;
-    for(int i = 0; i < 64; i++) {
-        if(i % 8 == 0){
-            std::cout << std::endl;
-        }
-        std::cout << input_scales[i] <<" ";
-    }
-    std::cout << std::endl;
+    // extract_q8_0(input_q8.data(), N, K, input_int8.data(), input_scales.data());
+    extract_q8_0_custom<QK>(input_q8.data(), N * K, input_int8.data(), input_scales.data());
+    auto end_input_time = ggml_time_us();
+    printf("[Debug] 输入量化完成: int8数据量=%zu, scale数量=%zu, 耗时=%.2f ms\n", 
+           input_int8.size(), input_scales.size(), (end_input_time - start_time) / 1000.0);
+
+    // std::cout << "input_scale:" ;
+    // for(int i = 0; i < 64; i++) {
+    //     if(i % 8 == 0){
+    //         std::cout << std::endl;
+    //     }
+    //     std::cout << input_scales[i] <<" ";
+    // }
+    // std::cout << std::endl;
 
     const int K_in = (K + 15) & ~15;
     const int K_w = (K + 31) & ~31;
@@ -1234,15 +1454,19 @@ static void compute_matmul_q8_0_parallel(
     std::vector<int8_t> input_npu(N * K_in, 0);
     to_npu_feature_layout(input_int8.data(), N, K, input_npu.data());
 
+    auto end_input_layout_time = ggml_time_us();
+    printf("[Debug] 输入布局转换完成: 耗时=%.2f ms\n", 
+           (end_input_layout_time - end_input_time) / 1000.0);
+
     // Step 2: Extract weight data (already Q8_0 with IOMMU mapping)
     std::vector<int8_t> weight_int8(M * K, 0);
     std::vector<float> weight_scales(M * K / QK, 0);
     
     // Weight tensor should already be Q8_0 format with IOMMU mapping
-    if (src0->type != GGML_TYPE_Q8_0) {
-        fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to Q8_0, got type %d\n", src0->type);
-        throw std::runtime_error("Weight tensor not pre-quantized");
-    }
+    // if (src0->type != GGML_TYPE_Q8_0) {
+    //     fprintf(stderr, "[NPU] Error: Weight tensor should be pre-quantized to Q8_0, got type %d\n", src0->type);
+    //     throw std::runtime_error("Weight tensor not pre-quantized");
+    // }
 
     uint64_t weight_dma_base = 0;
     Domain* weight_domain = find_tensor_domain(src0);
@@ -1256,25 +1480,18 @@ static void compute_matmul_q8_0_parallel(
     size_t nbytes = ggml_nbytes(src0);
     data_backup.resize(nbytes);
     memcpy(data_backup.data(), src0->data, nbytes);
-    
-    extract_q8_0((const block_q8_0*)src0->data, M, K, weight_int8.data(), weight_scales.data());
-    
-    std::cout << "weight_scale:" ;
-    for(int i = 0; i < 64; i++) {
-        if(i % 8 == 0){
-            std::cout << std::endl;
-        }
-        std::cout << weight_scales[i] <<" ";
-    }
-    std::cout << std::endl;
-    // Step 3: Convert to NPU layout
+    auto end_backup_time = ggml_time_us();
+    printf("[Debug] 权重备份完成: %zu bytes, 耗时=%.2f ms\n", nbytes, (end_backup_time - end_input_layout_time) / 1000.0);
 
+  
+    // std::vector<block_q8_0_512> weight_q8((M * K) / QK);
+    // convert_q8_to_512((const block_q8_0*)src0->data, weight_q8.data(), M * K);
+    extract_q8_0_custom<QK>((const block_q8_0_512*)src0->data, M * K, weight_int8.data(), weight_scales.data());
     
-    // NOTE: weight_npu will be created in-place at src0->data later (Step 4)
-    
-    // Step 4: Get DMA addresses from existing IOMMU mappings
-    // STRATEGY: Convert Q8_0 block format to NPU layout IN-PLACE at tensor->data
-    // This allows reusing the existing IOMMU mapping without creating a new one
+    auto end_time = ggml_time_us();
+    printf("[Debug] 权重提取完成: int8数据量=%zu, scale数量=%zu, 耗时=%.2f ms\n", 
+           weight_int8.size(), weight_scales.size(), (end_time - end_backup_time) / 1000.0);
+   
     
     
     if (weight_domain && src0->name) {
@@ -1321,6 +1538,10 @@ static void compute_matmul_q8_0_parallel(
         }
     }
 
+    auto end_conversion_time = ggml_time_us();
+    printf("[Debug] 权重布局转换完成: 耗时=%.2f ms\n", 
+           (end_conversion_time - end_time) / 1000.0);
+
     // ✅ Step 4.5: Get Domain for input buffer (use specialized IOMMU-mapped buffer)
     Domain* input_domain = find_domain_by_id(domain_id);
     if (!input_domain || !input_domain->input) {
@@ -1340,6 +1561,9 @@ static void compute_matmul_q8_0_parallel(
     memcpy(input_domain->input->virtual_addr, input_npu.data(), input_size);
 
 
+    auto end_input_copy_time = ggml_time_us();
+    printf("[Debug] 输入数据复制完成: %zu bytes, 耗时=%.2f ms\n", input_size, (end_input_copy_time - end_conversion_time) / 1000.0);
+
     flush_cache(input_domain->input->virtual_addr, input_size);
     uint64_t input_dma_base = input_domain->input->iommu_addr;
     
@@ -1347,16 +1571,7 @@ static void compute_matmul_q8_0_parallel(
             input_domain->input->virtual_addr, 
             input_domain->input->iommu_addr, 
             input_size);
-    
-    // Fallback: if no IOMMU mapping found for weight, create temporary buffer
-    // if (weight_dma_base == 0) {
-    //     fprintf(stderr, "[NPU] Warning: No IOMMU mapping found, using temporary buffer\n");
-    //     std::vector<int8_t> weight_dma_buf(M * K_w);
-    //     to_npu_weight_layout(weight_int8.data(), M, K, weight_dma_buf.data());
-    //     flush_cache(weight_dma_buf.data(), M * K_w);
-    //     weight_dma_base = (uint64_t)weight_dma_buf.data();
-    // }
-    
+
     // Step 5: Build task list (block splitting)
     auto tasks = std::make_shared<std::vector<std::tuple<int, int, matmul_task_t>>>();
     tasks->reserve(ceil_int(M, BLOCK_WEIGHT) * ceil_int(K, BLOCK_SHARED));
@@ -1379,7 +1594,9 @@ static void compute_matmul_q8_0_parallel(
         }
         input_dma_base = input_domain->input->iommu_addr;
     }
-    
+    auto end_task_time = ggml_time_us();
+    printf("[Debug] 任务列表构建完成: 任务数量=%zu, 耗时=%.2f ms\n", 
+           tasks->size(), (end_task_time - end_input_copy_time) / 1000.0);
     // Step 6: Adjust batch size based on task count
     // if (tasks->size() <= PER_TASK_CORE_NUM) {
     //     TASKS_LOCAL_PER_NUM = PER_TASK_CORE_NUM;
@@ -1404,7 +1621,9 @@ static void compute_matmul_q8_0_parallel(
     int index = 0;
     const int scale_per_k = K / QK;
     float* dst_data = (float*)dst->data;
-    
+    auto end_time2 = ggml_time_us();
+    printf("[Debug] 任务提交完成: 任务数量=%zu, 耗时=%.2f ms\n", 
+           tasks->size(), (end_time2 - end_task_time) / 1000.0);
     for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
         {
             std::unique_lock<std::mutex> lock(cpu_worker_mtx);
@@ -1429,6 +1648,7 @@ static void compute_matmul_q8_0_parallel(
             // Process output with NEON optimization
             // For each weight row in [j, j+joff_max), get the scale for block k/32
             // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
+            // cur_block_scale = input_scales[j * scale_per_k + k / QK] * weight_scales[j * scale_per_k + k / QK];
             for (int i = 0; i < N; i++) { // 行遍历 (Height)
                 for (int joff = 0; joff < current_m_task; joff ++) { 
                     auto cur_M = j + joff;
@@ -1453,6 +1673,8 @@ static void compute_matmul_q8_0_parallel(
         }
         index = (index + 1) & 0x1;
     }
+    auto end_time3 = ggml_time_us();
+    printf("[Debug] CPU处理完成: 耗时=%.2f ms\n", (end_time3 - end_time2) / 1000.0);
     memcpy(src0->data, data_backup.data(), ggml_nbytes(src0));
     npu_tasks_shared.reset();
 }
@@ -1483,7 +1705,7 @@ int ggml_can_use_npu(const struct ggml_tensor* src0, const struct ggml_tensor* s
     
     // Weight must be Q8_0 (pre-quantized in model loading stage)
     // NOTE: With the new pipeline, weights should already be Q8_0
-    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_F16) {
+    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_F16 ) {
         fprintf(stderr, "[NPU] Weight type is %d, expected Q8_0 (pre-quantized)\n", src0->type);
         return 0;
     }
@@ -1517,22 +1739,25 @@ void ggml_compute_forward_mul_mat_npu(
    
     Domain* weight_domain = find_tensor_domain(src0);
     int domain_id = weight_domain ? weight_domain->id : get_default_domain_id();
-    
+    auto start_time = std::chrono::high_resolution_clock::now();
     try {
-        // if(type == GGML_TYPE_Q8_0) {
-        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
-        //     input_type.store(1, std::memory_order_release);
-        //     compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
-        // }else{
-        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
-        //     input_type.store(0, std::memory_order_release);
+        if(type == GGML_TYPE_Q8_0) {
+            std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
+            input_type.store(1, std::memory_order_release);
+            compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
+        }else{
+            std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
+            input_type.store(0, std::memory_order_release);
             compute_matmul_fp16_parallel(src0, src1, dst, domain_id);
-        // }
+        }
     } catch (const std::exception& e) {
         fprintf(stderr, "[NPU] Error: %s, falling back to CPU\n", e.what());
         // Let GGML handle CPU fallback by not writing to dst
         throw;
     }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    printf("[NPU] Matmul completed in %.2f ms\n", 
+           std::chrono::duration<double, std::milli>(end_time - start_time).count());
 }
 
 // ============================================================================

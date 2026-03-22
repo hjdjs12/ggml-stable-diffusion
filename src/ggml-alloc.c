@@ -1222,7 +1222,6 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
         size_t this_size = 0;
         if (t->data == NULL && t->view_src == NULL) {
             size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-            
             // 确保每个 Tensor 申请的大小是对齐到 PAGE_SIZE 的
             this_size = GGML_PAD(alloc_size, PAGE_SIZE); 
             

@@ -391,6 +391,7 @@ extern "C" {
         GGML_TYPE_F16     = 1,
         GGML_TYPE_Q4_0    = 2,
         GGML_TYPE_Q4_1    = 3,
+        GGML_TYPE_Q8_0_512 = 4,
         // GGML_TYPE_Q4_2 = 4, support has been removed
         // GGML_TYPE_Q4_3 = 5, support has been removed
         GGML_TYPE_Q5_0    = 6,
@@ -418,6 +419,7 @@ extern "C" {
         GGML_TYPE_F64     = 28,
         GGML_TYPE_IQ1_M   = 29,
         GGML_TYPE_BF16    = 30,
+        
         // GGML_TYPE_Q4_0_4_4 = 31, support has been removed from gguf files
         // GGML_TYPE_Q4_0_4_8 = 32,
         // GGML_TYPE_Q4_0_8_8 = 33,

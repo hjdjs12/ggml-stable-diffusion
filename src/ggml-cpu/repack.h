@@ -26,6 +26,7 @@ template <int K, int N> struct block {
 };
 
 // control size
+//temporary delete because of the q8_0 block size change, need to re-evaluate the control size and performance after the change
 static_assert(sizeof(block<4, 4>) == 4 * sizeof(ggml_half) + QK8_0 * 2, "wrong block<4,4> size/padding");
 static_assert(sizeof(block<4, 8>) == 8 * sizeof(ggml_half) + QK8_0 * 4, "wrong block<4,8> size/padding");
 static_assert(sizeof(block<8, 4>) == 4 * sizeof(ggml_half) + QK8_0 * 4, "wrong block<8,4> size/padding");

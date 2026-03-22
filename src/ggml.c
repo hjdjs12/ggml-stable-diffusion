@@ -607,6 +607,7 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 }
 
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
         .blck_size                = 1,
@@ -699,6 +700,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_name                = "q8_0",
         .blck_size                = QK8_0,
         .type_size                = sizeof(block_q8_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
+    },
+    [GGML_TYPE_Q8_0_512] = {
+        .type_name                = "q8_0_256",
+        .blck_size                = 512,
+        .type_size                = 514,
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
@@ -1241,7 +1250,9 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
             return 0;
         }
     }
-
+    if(tensor->type == GGML_TYPE_Q8_0_512){
+        return 514;
+    }
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);
     if (blck_size == 1) {

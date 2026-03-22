@@ -1250,14 +1250,14 @@ void ggml_compute_forward_mul_mat(
                 // 线程 0：使用 NPU 执行
                 int op_num = atomic_fetch_add(&g_matmul_counter, 1) + 1;
                 printf("\n[MATMUL #%d] Using NPU (single thread mode)\n", op_num);
-                printf("  src0 (weight): %s, shape=[%lld, %lld], type=%d\n", src0->name, src0->ne[0], src0->ne[1], src0->type);
-                printf("  src1 (input):  %s, shape=[%lld, %lld], type=%d\n", src1->name, src1->ne[0], src1->ne[1], src1->type);
-                printf("  dst (output):  %s, shape=[%lld, %lld], type=%d\n", dst->name, dst->ne[0], dst->ne[1], dst->type);
-                
+                printf("  src0 (weight): %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src0->name, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->type);
+                printf("  src1 (input):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src1->name, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], src1->type);
+                printf("  dst (output):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", dst->name, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], dst->type);
+
                 // 打印 src1 (input) 的前 64 个值 (FP32)
                 printf("[MATMUL #%d] Input (src1, first 64 floats):\n  ", op_num);
                 float* input_data = (float*)src1->data;
-                size_t input_elements = src1->ne[0] * src1->ne[1];
+                size_t input_elements = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
                 size_t input_print_count = input_elements < 64 ? input_elements : 64;
                 for (size_t i = 0; i < input_print_count; i++) {
                     printf("%.6f ", input_data[i]);
@@ -1564,7 +1564,7 @@ UseGgmlGemm2:;
     if (ith == 0) {
         int op_num = atomic_fetch_add(&g_matmul_counter, 1) + 1;
         printf("\n[MATMUL #%d] Using CPU (completed)\n", op_num);
-        printf("  src0 (weight): %s, shape=[%lld, %lld], type=%d\n", src0->name, (long long)src0->ne[0], (long long)src0->ne[1], src0->type);
+        printf("  src0 (weight): %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src0->name, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3], src0->type);
         
         struct ggml_tensor* cur = src0;
         while (cur != NULL) {
@@ -1604,13 +1604,13 @@ UseGgmlGemm2:;
             }
         }
         
-        printf("  src1 (input):  %s, shape=[%lld, %lld], type=%d\n", src1->name, (long long)src1->ne[0], (long long)src1->ne[1], src1->type);
-        printf("  dst (output):  %s, shape=[%lld, %lld], type=%d\n", dst->name, (long long)dst->ne[0], (long long)dst->ne[1], dst->type);
+        printf("  src1 (input):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src1->name, (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3], src1->type);
+        printf("  dst (output):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", dst->name, (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3], dst->type);
         
         // 打印 src1 (input) 的前 64 个值 (FP32)
         printf("[MATMUL #%d] Input (src1, first 64 floats):\n  ", op_num);
         float* input_data = (float*)src1->data;
-        size_t input_elements = src1->ne[0] * src1->ne[1];
+        size_t input_elements = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
         size_t input_print_count = input_elements < 64 ? input_elements : 64;
         for (size_t i = 0; i < input_print_count; i++) {
             printf("%.6f ", input_data[i]);
@@ -1661,7 +1661,7 @@ UseGgmlGemm2:;
         FILE* fp = fopen(filename, "w");
         if (fp) {
             float* result = (float*)dst->data;
-            size_t total_elements = dst->ne[0] * dst->ne[1];
+            size_t total_elements = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
 
             // 写入文件：每行一个数字
             for (size_t i = 0; i < total_elements; i++) {
@@ -1679,7 +1679,7 @@ UseGgmlGemm2:;
         // 4. 保持原来的控制台预览打印（前 64 个）
         printf("[MATMUL #%d] Output (dst, first 64 floats):\n  ", op_num);
         float* result_ptr = (float*)dst->data;
-        size_t print_count = (dst->ne[0] * dst->ne[1]) < 64 ? (dst->ne[0] * dst->ne[1]) : 64;
+        size_t print_count = (dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3]) < 64 ? (dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3]) : 64;
         for (size_t i = 0; i < print_count; i++) {
             printf("%.6f ", result_ptr[i]);
             if ((i + 1) % 8 == 0) printf("\n  ");
