@@ -58,7 +58,8 @@ public:
     uint64_t iommu_addr;
     uint64_t mem_obj_handle;
     uint64_t domain_id;
-    IommuConfig() : iommu_addr(0), mem_obj_handle(0), domain_id(0) {}
+    size_t scale_offset;
+    IommuConfig() : iommu_addr(0), mem_obj_handle(0), domain_id(0) , scale_offset(0){}
 };
 
 

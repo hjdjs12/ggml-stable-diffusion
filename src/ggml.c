@@ -1251,7 +1251,8 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
         }
     }
     if(tensor->type == GGML_TYPE_Q8_0_512){
-        return 514;
+        uint64_t total_elements = tensor->ne[0] * tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
+        return total_elements + total_elements/512*2;
     }
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);
