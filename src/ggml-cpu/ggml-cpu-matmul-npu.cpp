@@ -1670,52 +1670,151 @@ static void compute_matmul_q8_0_parallel(
            tasks->size(), (end_time2 - end_task_time) / 1000.0);
     int64_t cpu_total_time  = 0;
     int64_t wait_total_time = 0;
+    // for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
+    //     {
+    //         auto s_time = ggml_time_us();
+    //         std::unique_lock<std::mutex> lock(cpu_worker_mtx);
+    //         cpu_cv.wait(lock, [&] { 
+    //             return npu_tasks_shared.use_count() != 0 && 
+    //                    npu_tasks_shared->at(t) != nullptr && 
+    //                    buffer_free[index].load(std::memory_order_acquire) == 1;
+    //         });
+    //         auto e_time = ggml_time_us();
+    //         wait_total_time += (e_time - s_time);
+    //     }
+    //     auto s_time = ggml_time_us();
+    //     for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
+    //         const auto [j, k, task] = tasks->at(t + toff);
+    //         int32_t* task_output = npu_tasks_shared->at(t + toff);
+            
+    //         // Invalidate cache to ensure CPU reads NPU-written data
+    //         invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT) * sizeof(int32_t));
+            
+    //         int current_m_task = std::min(M - j, BLOCK_WEIGHT);
+            
+         
+            
+    //         // Process output with NEON optimization
+    //         // For each weight row in [j, j+joff_max), get the scale for block k/32
+    //         // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
+    //         // cur_block_scale = input_scales[j * scale_per_k + k / QK] * weight_scales[j * scale_per_k + k / QK];
+    //         for (int i = 0; i < N; i++) { // 行遍历 (Height)
+    //             for (int joff = 0; joff < current_m_task; joff ++) { 
+    //                 auto cur_M = j + joff;
+    //                 auto target = feature_data(N, 4, joff, i);
+    //                 auto cur_offset_in_result = i * M + cur_M ;
+    //                 // std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[target] << "i:" <<i << " cur_M" << cur_M <<std::endl;
+    //                 // auto weight_scale_offset = cur_M * scale_per_k + k / QK;
+    //                 // auto input_scale_offset = i * scale_per_k + k / QK;
+    //                 // std::cout << "weight_scale_offset:" << weight_scale_offset << "    weight_scale:" << weight_scales[weight_scale_offset] << std::endl;
+    //                 float combined_scale = input_scales[i * scale_per_k + k / QK] * ggml_fp16_to_fp32(weight_scales_ptr[cur_M * scale_per_k + k / QK]);
+    //                 dst_data[cur_offset_in_result] += (double)task_output[target] * combined_scale;
+    //                 // dst_data[cur_offset_in_result] += (double)task_output[target]* input_scales[input_scale_offset] * weight_scales[weight_scale_offset];
+    //                 // dst_data[cur_offset_in_result] += (double)task_output[target];
+    //             }
+    //         }
+    //     }
+    //     auto e_time = ggml_time_us();
+    //     cpu_total_time += (e_time - s_time);
+    //     {
+    //         std::lock_guard<std::mutex> lock(npu_worker_mtx);
+    //         buffer_free[index].store(0, std::memory_order_release);
+    //         npu_cv.notify_one();
+    //     }
+    //     index = (index + 1) & 0x1;
+    // }
     for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
         {
             auto s_time = ggml_time_us();
             std::unique_lock<std::mutex> lock(cpu_worker_mtx);
             cpu_cv.wait(lock, [&] { 
                 return npu_tasks_shared.use_count() != 0 && 
-                       npu_tasks_shared->at(t) != nullptr && 
-                       buffer_free[index].load(std::memory_order_acquire) == 1;
+                    npu_tasks_shared->at(t) != nullptr && 
+                    buffer_free[index].load(std::memory_order_acquire) == 1;
             });
             auto e_time = ggml_time_us();
             wait_total_time += (e_time - s_time);
         }
+
         auto s_time = ggml_time_us();
+
         for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
             const auto [j, k, task] = tasks->at(t + toff);
             int32_t* task_output = npu_tasks_shared->at(t + toff);
-            
-            // Invalidate cache to ensure CPU reads NPU-written data
+
             invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT) * sizeof(int32_t));
-            
+
             int current_m_task = std::min(M - j, BLOCK_WEIGHT);
-            
-         
-            
-            // Process output with NEON optimization
-            // For each weight row in [j, j+joff_max), get the scale for block k/32
-            // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
-            // cur_block_scale = input_scales[j * scale_per_k + k / QK] * weight_scales[j * scale_per_k + k / QK];
-            for (int i = 0; i < N; i++) { // 行遍历 (Height)
-                for (int joff = 0; joff < current_m_task; joff ++) { 
-                    auto cur_M = j + joff;
-                    auto target = feature_data(N, 4, joff, i);
-                    auto cur_offset_in_result = i * M + cur_M ;
-                    // std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[target] << "i:" <<i << " cur_M" << cur_M <<std::endl;
-                    // auto weight_scale_offset = cur_M * scale_per_k + k / QK;
-                    // auto input_scale_offset = i * scale_per_k + k / QK;
-                    // std::cout << "weight_scale_offset:" << weight_scale_offset << "    weight_scale:" << weight_scales[weight_scale_offset] << std::endl;
-                    float combined_scale = input_scales[i * scale_per_k + k / QK] * ggml_fp16_to_fp32(weight_scales_ptr[cur_M * scale_per_k + k / QK]);
-                    dst_data[cur_offset_in_result] += (double)task_output[target] * combined_scale;
-                    // dst_data[cur_offset_in_result] += (double)task_output[target]* input_scales[input_scale_offset] * weight_scales[weight_scale_offset];
-                    // dst_data[cur_offset_in_result] += (double)task_output[target];
+            const int k_scale_idx = k / QK;
+
+            // 预先加载 weight_scales 为 float（避免内层循环重复 fp16->fp32 转换）
+            // 将 weight_scales 缓存到局部数组，减少重复转换开销
+            // weight_scale_row[joff] = fp32(weight_scales_ptr[(j+joff)*scale_per_k + k/QK])
+            float w_scale_cache[BLOCK_WEIGHT];
+            for (int joff = 0; joff < current_m_task; joff++) {
+                w_scale_cache[joff] = ggml_fp16_to_fp32(
+                    weight_scales_ptr[(j + joff) * scale_per_k + k_scale_idx]);
+            }
+
+            // 外层按 joff 步长4并行（参考第二段风格），内层遍历 N
+            // joff 步长4 → 一次 NEON 处理4个权重行的结果
+    #pragma omp parallel for num_threads(4)
+            for (int joff = 0; joff < current_m_task; joff += 4) {
+                const int cur_M_base = j + joff;
+                const int lanes = std::min(4, current_m_task - joff); // 处理边界
+
+                // 加载4个权重scale（可能不足4个时用0填充）
+                float32x4_t w_scale = {
+                    (lanes > 0) ? w_scale_cache[joff + 0] : 0.0f,
+                    (lanes > 1) ? w_scale_cache[joff + 1] : 0.0f,
+                    (lanes > 2) ? w_scale_cache[joff + 2] : 0.0f,
+                    (lanes > 3) ? w_scale_cache[joff + 3] : 0.0f,
+                };
+
+                // feature_data(N, 4, joff, i) 中 i=0 时的初始偏移
+                // 随 i 递增，每次 +4（参考第二段 feature_offset += 4）
+                int feature_offset = feature_data(N, 4, joff, 0);
+
+                for (int i = 0; i < N; i++) {
+                    // Prefetch：预取下一行的 dst 写目标 和 NPU 输出数据
+                    if (i + LOOKAHEAD < N) {
+                        __builtin_prefetch(&dst_data[(i + LOOKAHEAD) * M + cur_M_base],
+                                        1 /*write*/, 1 /*keep*/);
+                        if ((i % 4) == 0) {
+                            __builtin_prefetch(&task_output[feature_offset + (LOOKAHEAD * 4)],
+                                            0 /*read*/, 1 /*keep*/);
+                        }
+                    }
+
+                    // 当前行 input_scale（标量，广播到4个权重行）
+                    const float i_scale = input_scales[i * scale_per_k + k_scale_idx];
+                    float32x4_t v_i_scale = vdupq_n_f32(i_scale);
+
+                    // combined_scale[joff+0..3] = i_scale * w_scale[0..3]
+                    float32x4_t combined = vmulq_f32(v_i_scale, w_scale);
+
+                    // 从 NPU 输出加载4个 int32，转 float
+                    int32x4_t v_int32 = vld1q_s32(&task_output[feature_offset]);
+                    float32x4_t v_val  = vcvtq_f32_s32(v_int32);
+
+                    // 乘以 combined_scale
+                    v_val = vmulq_f32(v_val, combined);
+
+                    // 累加到 dst_data（注意：第一段原始用 double 累加，
+                    // 这里改为 float 以支持 NEON；如需 double 精度请保留原始路径）
+                    float* out_ptr = &dst_data[i * M + cur_M_base];
+                    float32x4_t out_old = vld1q_f32(out_ptr);
+                    out_old = vaddq_f32(out_old, v_val);
+                    vst1q_f32(out_ptr, out_old);
+
+                    feature_offset += 4;
                 }
             }
         }
+
         auto e_time = ggml_time_us();
         cpu_total_time += (e_time - s_time);
+
         {
             std::lock_guard<std::mutex> lock(npu_worker_mtx);
             buffer_free[index].store(0, std::memory_order_release);
