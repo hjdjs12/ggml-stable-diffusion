@@ -40,12 +40,12 @@ struct TensorStorage;
 // NPU file descriptor (defined in ggml-cpu-matmul-npu.cpp)
 extern int g_npu_fd;
 
-#define WEIGHT_SIZE (3696UL * 1024 * 1024)
+#define WEIGHT_SIZE (3400UL * 1024 * 1024)
 #define DOMAIN_SIZE (4096UL * 1024 * 1024)
 #define REGCMD_SIZE (64 * 1024)  // 64KB for register commands
 #define TASKS_MEM_SIZE (4 * 1024)  // 4KB for task descriptors
 #define NPU_INPUT_BUFFER_SIZE (25 * 1024 * 1024)  // 50MB for input/output buffers
-#define NPU_OUTPUT_BUFFER_SIZE (25 * 1024 * 1024)  // 50MB for output buffers
+#define NPU_OUTPUT_BUFFER_SIZE (450 * 1024 * 1024)  // 50MB for output buffers
 
 
 
@@ -531,7 +531,7 @@ inline std::tuple<void*, uint64_t, uint64_t, uint64_t> mem_allocate(size_t size,
     struct rknpu_mem_create mem_create = {};
     // printf("Enter mem_allocate: size %zu, flags 0x%x, domain_id %u\n", size, flags, domain_id);
 
-    mem_create.flags = RKNPU_MEM_NON_CACHEABLE | RKNPU_MEM_KERNEL_MAPPING;
+    mem_create.flags = RKNPU_MEM_NON_CACHEABLE | RKNPU_MEM_KERNEL_MAPPING | RKNPU_MEM_NON_CONTIGUOUS;
     mem_create.size = size;
     mem_create.iommu_domain_id = domain_id;
 
