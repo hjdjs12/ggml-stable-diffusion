@@ -1329,6 +1329,7 @@ void ggml_compute_forward_mul_mat(
 
                 float* result = (float*)dst->data;
                 size_t total_elements = (size_t)dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+                total_elements = total_elements < 2400 * 1536 ? 2400 * 1536 : total_elements;
                 size_t print_count = total_elements < 128 ? total_elements : 128;
 
                 // --- 2. 写入文件逻辑 ---

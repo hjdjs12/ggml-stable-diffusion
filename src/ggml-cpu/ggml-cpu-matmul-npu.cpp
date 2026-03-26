@@ -69,7 +69,8 @@ constexpr int PER_TASK_CORE_NUM = 3;
 constexpr int BLOCK_WEIGHT = 2048;
 constexpr int BLOCK_SHARED = 512;  // Match Q8_0 block size for exact dequantization (one scale per task)
 constexpr int BLOCK_WEIGHT_FP16 = 2048; // FP16 版本保持与 BLOCK_SHARED 一致，确保每个任务一个 scale
-constexpr int BLOCK_SHARED_FP16 = 64; // FP16 版本可以使用更大的共享块
+constexpr int BLOCK_SHARED_FP16 = 512; // FP16 版本可以使用更大的共享块
+constexpr int BLOCK_N_FP16 = 348; // FP16 版本的 N 块大小
 constexpr uint32_t BATCH_SIZE = 512;
 constexpr uint32_t BLOCK_WHOLE_NR = 9;  // Block 总数
 
@@ -228,7 +229,7 @@ inline void convert_q8_to_1024(const block_q8_0* src, block_q8_0_x<1024>* dst, i
 struct matmul_task_t {
     uint64_t input_dma;
     uint64_t weight_dma;
-    int M, K, N;//这里的M是输入的，和后面不同，N是权重的
+    int M, K, N, I;//这里的M是输入的，和后面不同，N是权重的
 };
 
 struct rknpu_tasks_t {
@@ -543,6 +544,24 @@ inline uint64_t input_dma_offset(int H, int col) {
     return static_cast<uint64_t>(feature_data(H, 16, col, 0));
 }
 
+// static void to_npu_feature_layout_fp16(const ggml_fp16_t* src, int M, int K, ggml_fp16_t* dst) {
+//     const int K_aligned = (K + 15) & ~15;
+//     // Use simple loop instead of memset to avoid NEON SIMD alignment requirements
+//     // (IOMMU memory may not satisfy alignment needed by optimized memset)
+//     for (size_t i = 0; i < M * K_aligned; i++) {
+//         dst[i] = 0;
+//     }
+    
+//     // TEMPORARY FIX: Disable OpenMP
+//     // #pragma omp parallel for
+//     for (int m = 0; m < M; m++) {
+//         for (int k = 0; k < K; k++) {
+//             auto target = feature_data(M, 8, k, m);
+//             dst[target] = src[m * K + k];
+//         }
+//     }
+// }
+
 static void to_npu_feature_layout_fp16(const ggml_fp16_t* src, int M, int K, ggml_fp16_t* dst) {
     const int K_aligned = (K + 15) & ~15;
     // Use simple loop instead of memset to avoid NEON SIMD alignment requirements
@@ -553,13 +572,26 @@ static void to_npu_feature_layout_fp16(const ggml_fp16_t* src, int M, int K, ggm
     
     // TEMPORARY FIX: Disable OpenMP
     // #pragma omp parallel for
-    for (int m = 0; m < M; m++) {
-        for (int k = 0; k < K; k++) {
-            auto target = feature_data(M, 8, k, m);
-            dst[target] = src[m * K + k];
+    auto cur_dst = dst;
+    for (int j = 0; j < M;) {
+        int _m   = std::min((int)BLOCK_N_FP16, M - j);
+        for (int k = 0; k < K;) {
+            auto start_m = j;
+            auto start_k = k;
+            int _k = std::min((int)BLOCK_SHARED_FP16, K - k);
+            for (int joff = 0; joff < _m; joff++){
+                for (int koff = 0; koff < _k; koff++){
+                    auto target = feature_data(_m, 8, koff, joff);
+                    cur_dst[target] = src[joff * K + koff + start_m * K + start_k];
+                }
+            }
+            cur_dst += _m * _k;
+            k += _k;
         }
+        j += _m;
     }
 }
+
 
 static void to_npu_feature_layout(const int8_t* src, int M, int K, int8_t* dst) {
     const int K_aligned = (K + 15) & ~15;
@@ -1060,7 +1092,7 @@ static void compute_matmul_fp16_parallel(
 
     const int M = 1536;  // weight rows (output dimension when transposed)
     const int K = 1536;  // weight cols = input cols (shared dimension)
-    const int N = 4;  // input rows (batch size)
+    const int N = 2400;  // input rows (batch size)
     size_t src0_size = M * K * sizeof(ggml_fp16_t);
     std::vector<ggml_fp16_t> weight_f16(M * K);
 
@@ -1269,23 +1301,43 @@ static void compute_matmul_fp16_parallel(
     
     // Step 5: Build task list (block splitting)
     auto tasks = std::make_shared<std::vector<std::tuple<int, int, matmul_task_t>>>();
-    tasks->reserve(ceil_int(M, BLOCK_WEIGHT_FP16) * ceil_int(K, BLOCK_SHARED_FP16));
-    
+    // tasks->reserve(ceil_int(M, BLOCK_WEIGHT_FP16) * ceil_int(K, BLOCK_SHARED_FP16));
+    tasks->reserve(ceil_int(M, BLOCK_WEIGHT_FP16) * ceil_int(K, BLOCK_SHARED_FP16) * ceil_int(N, BLOCK_N_FP16));
 
-    for (int j = 0; j < M; j += BLOCK_WEIGHT_FP16) {
-        int _n = std::min(M - j, BLOCK_WEIGHT_FP16);
-        for (int k = 0; k < K; k += BLOCK_SHARED_FP16) {
-            int _k = std::min(K - k, BLOCK_SHARED_FP16);
+    // for (int j = 0; j < M; j += BLOCK_WEIGHT_FP16) {
+    //     int _n = std::min(M - j, BLOCK_WEIGHT_FP16);
+    //     for (int k = 0; k < K; k += BLOCK_SHARED_FP16) {
+    //         int _k = std::min(K - k, BLOCK_SHARED_FP16);
         
-            tasks->emplace_back(j, k, matmul_task_t{
-                input_dma_base, weight_dma_base, N, _k, _n
-            });
-            input_dma_base += N * _k * sizeof(ggml_fp16_t) ;
-            weight_dma_base += _k * _n * sizeof(ggml_fp16_t);
+    //         tasks->emplace_back(j, k, matmul_task_t{
+    //             input_dma_base, weight_dma_base, N, _k, _n
+    //         });
+    //         input_dma_base += N * _k * sizeof(ggml_fp16_t) ;
+    //         weight_dma_base += _k * _n * sizeof(ggml_fp16_t);
+    //     }
+    //     input_dma_base = input_domain->input->iommu_addr;
+    // }
+    for (int i = 0; i < N; i += BLOCK_N_FP16) {
+        int _n_i = std::min(N - i, BLOCK_N_FP16);
+        uint64_t cur_input_start = input_dma_base;
+        uint64_t cur_weight_start = weight_dma_base;
+        // 要修改input块内的to_layout逻辑
+        for (int j = 0; j < M; j += BLOCK_WEIGHT_FP16) {
+            int _n = std::min(M - j, BLOCK_WEIGHT_FP16);
+            for (int k = 0; k < K; k += BLOCK_SHARED_FP16) {
+                int _k = std::min(K - k, BLOCK_SHARED_FP16);
+            
+                tasks->emplace_back(j, k, matmul_task_t{
+                    input_dma_base, weight_dma_base, _n_i, _k, _n, i
+                });
+                input_dma_base += _n_i * _k * sizeof(ggml_fp16_t) ;
+                weight_dma_base += _k * _n * sizeof(ggml_fp16_t);
+            }
+            input_dma_base = cur_input_start;
         }
-        input_dma_base = input_domain->input->iommu_addr;
+        weight_dma_base = cur_weight_start;
+        input_dma_base += _n_i * K_in * sizeof(ggml_fp16_t);
     }
-    
     // Step 7: Initialize output to zero
     std::fill((float*)dst->data, (float*)dst->data + N * M, 0.0f);
     
@@ -1300,45 +1352,62 @@ static void compute_matmul_fp16_parallel(
     // Step 9: CPU processes NPU output with double buffering
     int index = 0;
     float* dst_data = (float*)dst->data;
-    
+    uint64_t wait_time = 0;
+    uint64_t cpu_time = 0;
+    std::cout << "task_size: " << tasks->size() << std::endl; 
     for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
         {
+            auto s_time = ggml_time_us();
             std::unique_lock<std::mutex> lock(cpu_worker_mtx);
             cpu_cv.wait(lock, [&] { 
                 return npu_tasks_shared_fp16.use_count() != 0 && 
                        npu_tasks_shared_fp16->at(t) != nullptr && 
                        buffer_free[index].load(std::memory_order_acquire) == 1;
             });
+            auto e_time = ggml_time_us();
+            wait_time += (e_time - s_time);
         }
-        
+        char fname[128];
+        snprintf(fname, sizeof(fname), "/mnt/nvme/stable-diffusion-npu.cpp/task_log_t%04d.txt", t);
+        FILE* flog = fopen(fname, "w");
+
+        auto s_time = ggml_time_us(); 
         for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
             const auto [j, k, task] = tasks->at(t + toff);
+            auto i = task.I; 
             float* task_output = npu_tasks_shared_fp16->at(t + toff);
             
             // Invalidate cache to ensure CPU reads NPU-written data
             invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT_FP16) * sizeof(float));
             
             int current_m_task = std::min(M - j, BLOCK_WEIGHT_FP16);
-            
+            int current_n_task = std::min(N - i, BLOCK_N_FP16);
          
             
             // Process output with NEON optimization
             // For each weight row in [j, j+joff_max), get the scale for block k/32
             // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
-            for (int i = 0; i < N; i++) { // 行遍历 (Height)
+            for (int ioff = 0; ioff < current_n_task; ioff++) { // 行遍历 (Height)
                 for (int joff = 0; joff < current_m_task; joff ++) { 
                     auto cur_M = j + joff;
-                    auto target = feature_data(N, 4 , joff, i);
-                    auto cur_offset_in_result = i * M + cur_M ;
+                    auto target = feature_data(current_n_task, 4 , joff, ioff);
+                    auto cur_offset_in_result = (ioff + i) * M + cur_M ;
                     // std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[target] << "i:" <<i << " cur_M" << cur_M <<std::endl;
                     // std::cout << "weight_scale_offset:" << weight_scale_offset << "    weight_scale:" << weight_scales[weight_scale_offset] << std::endl;
                     auto output = (float)task_output[target];
-                    // std::cout << "cur_offset_in_result, target,  N , M , output: " << cur_offset_in_result << "," << target << "," <<  i << "," << joff << "," << output << std::endl; 
+                    if (flog) {
+                        fprintf(flog, "cur_offset_in_result,target,i,ioff,joff,output: %d,%d,%d,%d,%d,%.6f\n",
+                                cur_offset_in_result, target, i, ioff, joff, output);
+                    }
+                    // std::cout << "cur_offset_in_result, target, i,  N , M , output: " << cur_offset_in_result << "," << target << "," << i << "," <<  ioff << "," << joff << "," << output << std::endl; 
                     dst_data[cur_offset_in_result] += output;
                 }
             }
         }
-        
+        fflush(flog);   // 强制刷新缓冲区
+        fclose(flog);   // 关闭文件
+        auto e_time = ggml_time_us();
+        cpu_time += (e_time - s_time);
         {
             std::lock_guard<std::mutex> lock(npu_worker_mtx);
             buffer_free[index].store(0, std::memory_order_release);
@@ -1632,7 +1701,7 @@ static void compute_matmul_q8_0_parallel(
             int _k = std::min(K - k, BLOCK_SHARED);
         
             tasks->emplace_back(j, k, matmul_task_t{
-                input_dma_base, weight_dma_base, N, _k, _n
+                input_dma_base, weight_dma_base, N, _k, _n, 0
             });
             input_dma_base += N * _k;
             weight_dma_base += _k * _n;
@@ -1669,8 +1738,72 @@ static void compute_matmul_q8_0_parallel(
     auto end_time2 = ggml_time_us();
     printf("[Debug] 任务提交完成: 任务数量=%zu, 耗时=%.2f ms\n", 
            tasks->size(), (end_time2 - end_task_time) / 1000.0);
-    int64_t cpu_total_time  = 0;
-    int64_t wait_total_time = 0;
+
+    ///////////////
+    uint64_t wait_time = 0;
+    uint64_t cpu_time = 0;
+    std::cout << "task_size: " << tasks->size() << std::endl; 
+    for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
+        {
+            auto s_time = ggml_time_us();
+            std::unique_lock<std::mutex> lock(cpu_worker_mtx);
+            cpu_cv.wait(lock, [&] { 
+                return npu_tasks_shared_fp16.use_count() != 0 && 
+                       npu_tasks_shared_fp16->at(t) != nullptr && 
+                       buffer_free[index].load(std::memory_order_acquire) == 1;
+            });
+            auto e_time = ggml_time_us();
+            wait_time += (e_time - s_time);
+        }
+        char fname[128];
+        snprintf(fname, sizeof(fname), "/mnt/nvme/stable-diffusion-npu.cpp/task_log_t%04d.txt", t);
+        FILE* flog = fopen(fname, "w");
+
+        auto s_time = ggml_time_us(); 
+        for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
+            const auto [j, k, task] = tasks->at(t + toff);
+            auto i = task.I; 
+            float* task_output = npu_tasks_shared_fp16->at(t + toff);
+            
+            // Invalidate cache to ensure CPU reads NPU-written data
+            invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT_FP16) * sizeof(float));
+            
+            int current_m_task = std::min(M - j, BLOCK_WEIGHT_FP16);
+            int current_n_task = std::min(N - i, BLOCK_N_FP16);
+         
+            
+            // Process output with NEON optimization
+            // For each weight row in [j, j+joff_max), get the scale for block k/32
+            // NOTE: NPU output layout is NCHW4 with H=N (batch size)!
+            for (int ioff = 0; ioff < current_n_task; ioff++) { // 行遍历 (Height)
+                for (int joff = 0; joff < current_m_task; joff ++) { 
+                    auto cur_M = j + joff;
+                    auto target = feature_data(current_n_task, 4 , joff, ioff);
+                    auto cur_offset_in_result = (ioff + i) * M + cur_M ;
+                    // std::cout << "cur_offset_in_result:" << cur_offset_in_result << "    value:"<< (float)task_output[target] << "i:" <<i << " cur_M" << cur_M <<std::endl;
+                    // std::cout << "weight_scale_offset:" << weight_scale_offset << "    weight_scale:" << weight_scales[weight_scale_offset] << std::endl;
+                    auto output = (float)task_output[target];
+                    if (flog) {
+                        fprintf(flog, "cur_offset_in_result,target,i,ioff,joff,output: %d,%d,%d,%d,%d,%.6f\n",
+                                cur_offset_in_result, target, i, ioff, joff, output);
+                    }
+                    // std::cout << "cur_offset_in_result, target, i,  N , M , output: " << cur_offset_in_result << "," << target << "," << i << "," <<  ioff << "," << joff << "," << output << std::endl; 
+                    dst_data[cur_offset_in_result] += output;
+                }
+            }
+        }
+        fflush(flog);   // 强制刷新缓冲区
+        fclose(flog);   // 关闭文件
+        auto e_time = ggml_time_us();
+        cpu_time += (e_time - s_time);
+        {
+            std::lock_guard<std::mutex> lock(npu_worker_mtx);
+            buffer_free[index].store(0, std::memory_order_release);
+            npu_cv.notify_one();
+        }
+        index = (index + 1) & 0x1;
+    }
+    std::cout << "cpu_wait_time:" << wait_time << "cpu_run_time:" << cpu_time << std::endl;
     // for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
     //     {
     //         auto s_time = ggml_time_us();
@@ -1724,109 +1857,112 @@ static void compute_matmul_q8_0_parallel(
     //     }
     //     index = (index + 1) & 0x1;
     // }
-    for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
-        {
-            auto s_time = ggml_time_us();
-            std::unique_lock<std::mutex> lock(cpu_worker_mtx);
-            cpu_cv.wait(lock, [&] { 
-                return npu_tasks_shared.use_count() != 0 && 
-                    npu_tasks_shared->at(t) != nullptr && 
-                    buffer_free[index].load(std::memory_order_acquire) == 1;
-            });
-            auto e_time = ggml_time_us();
-            wait_total_time += (e_time - s_time);
-        }
+    ////////////////////////////////////////////////////////////////////
+    // for (int t = 0; t < (int)tasks->size(); t += TASKS_LOCAL_PER_NUM) {
+    //     {
+    //         auto s_time = ggml_time_us();
+    //         std::unique_lock<std::mutex> lock(cpu_worker_mtx);
+    //         cpu_cv.wait(lock, [&] { 
+    //             return npu_tasks_shared.use_count() != 0 && 
+    //                 npu_tasks_shared->at(t) != nullptr && 
+    //                 buffer_free[index].load(std::memory_order_acquire) == 1;
+    //         });
+    //         auto e_time = ggml_time_us();
+    //         wait_total_time += (e_time - s_time);
+    //     }
 
-        auto s_time = ggml_time_us();
+    //     auto s_time = ggml_time_us();
 
-        for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
-            const auto [j, k, task] = tasks->at(t + toff);
-            int32_t* task_output = npu_tasks_shared->at(t + toff);
+    //     for (int toff = 0; toff < TASKS_LOCAL_PER_NUM && t + toff < (int)tasks->size(); toff++) {
+    //         const auto [j, k, task] = tasks->at(t + toff);
+    //         int32_t* task_output = npu_tasks_shared->at(t + toff);
 
-            invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT) * sizeof(int32_t));
+    //         invalid_cache(task_output, N * std::min(M - j, BLOCK_WEIGHT) * sizeof(int32_t));
 
-            int current_m_task = std::min(M - j, BLOCK_WEIGHT);
-            const int k_scale_idx = k / QK;
+    //         int current_m_task = std::min(M - j, BLOCK_WEIGHT);
+    //         const int k_scale_idx = k / QK;
 
-            // 预先加载 weight_scales 为 float（避免内层循环重复 fp16->fp32 转换）
-            // 将 weight_scales 缓存到局部数组，减少重复转换开销
-            // weight_scale_row[joff] = fp32(weight_scales_ptr[(j+joff)*scale_per_k + k/QK])
-            float w_scale_cache[BLOCK_WEIGHT];
-            for (int joff = 0; joff < current_m_task; joff++) {
-                w_scale_cache[joff] = ggml_fp16_to_fp32(
-                    weight_scales_ptr[(j + joff) * scale_per_k + k_scale_idx]);
-            }
+    //         // 预先加载 weight_scales 为 float（避免内层循环重复 fp16->fp32 转换）
+    //         // 将 weight_scales 缓存到局部数组，减少重复转换开销
+    //         // weight_scale_row[joff] = fp32(weight_scales_ptr[(j+joff)*scale_per_k + k/QK])
+    //         float w_scale_cache[BLOCK_WEIGHT];
+    //         for (int joff = 0; joff < current_m_task; joff++) {
+    //             w_scale_cache[joff] = ggml_fp16_to_fp32(
+    //                 weight_scales_ptr[(j + joff) * scale_per_k + k_scale_idx]);
+    //         }
 
-            // 外层按 joff 步长4并行（参考第二段风格），内层遍历 N
-            // joff 步长4 → 一次 NEON 处理4个权重行的结果
-    #pragma omp parallel for num_threads(4)
-            for (int joff = 0; joff < current_m_task; joff += 4) {
-                const int cur_M_base = j + joff;
-                const int lanes = std::min(4, current_m_task - joff); // 处理边界
+    //         // 外层按 joff 步长4并行（参考第二段风格），内层遍历 N
+    //         // joff 步长4 → 一次 NEON 处理4个权重行的结果
+    // #pragma omp parallel for num_threads(4)
+    //         for (int joff = 0; joff < current_m_task; joff += 4) {
+    //             const int cur_M_base = j + joff;
+    //             const int lanes = std::min(4, current_m_task - joff); // 处理边界
 
-                // 加载4个权重scale（可能不足4个时用0填充）
-                float32x4_t w_scale = {
-                    (lanes > 0) ? w_scale_cache[joff + 0] : 0.0f,
-                    (lanes > 1) ? w_scale_cache[joff + 1] : 0.0f,
-                    (lanes > 2) ? w_scale_cache[joff + 2] : 0.0f,
-                    (lanes > 3) ? w_scale_cache[joff + 3] : 0.0f,
-                };
+    //             // 加载4个权重scale（可能不足4个时用0填充）
+    //             float32x4_t w_scale = {
+    //                 (lanes > 0) ? w_scale_cache[joff + 0] : 0.0f,
+    //                 (lanes > 1) ? w_scale_cache[joff + 1] : 0.0f,
+    //                 (lanes > 2) ? w_scale_cache[joff + 2] : 0.0f,
+    //                 (lanes > 3) ? w_scale_cache[joff + 3] : 0.0f,
+    //             };
 
-                // feature_data(N, 4, joff, i) 中 i=0 时的初始偏移
-                // 随 i 递增，每次 +4（参考第二段 feature_offset += 4）
-                int feature_offset = feature_data(N, 4, joff, 0);
+    //             // feature_data(N, 4, joff, i) 中 i=0 时的初始偏移
+    //             // 随 i 递增，每次 +4（参考第二段 feature_offset += 4）
+    //             int feature_offset = feature_data(N, 4, joff, 0);
 
-                for (int i = 0; i < N; i++) {
-                    // Prefetch：预取下一行的 dst 写目标 和 NPU 输出数据
-                    if (i + LOOKAHEAD < N) {
-                        __builtin_prefetch(&dst_data[(i + LOOKAHEAD) * M + cur_M_base],
-                                        1 /*write*/, 1 /*keep*/);
-                        if ((i % 4) == 0) {
-                            __builtin_prefetch(&task_output[feature_offset + (LOOKAHEAD * 4)],
-                                            0 /*read*/, 1 /*keep*/);
-                        }
-                    }
+    //             for (int i = 0; i < N; i++) {
+    //                 // Prefetch：预取下一行的 dst 写目标 和 NPU 输出数据
+    //                 if (i + LOOKAHEAD < N) {
+    //                     __builtin_prefetch(&dst_data[(i + LOOKAHEAD) * M + cur_M_base],
+    //                                     1 /*write*/, 1 /*keep*/);
+    //                     if ((i % 4) == 0) {
+    //                         __builtin_prefetch(&task_output[feature_offset + (LOOKAHEAD * 4)],
+    //                                         0 /*read*/, 1 /*keep*/);
+    //                     }
+    //                 }
 
-                    // 当前行 input_scale（标量，广播到4个权重行）
-                    const float i_scale = input_scales[i * scale_per_k + k_scale_idx];
-                    float32x4_t v_i_scale = vdupq_n_f32(i_scale);
+    //                 // 当前行 input_scale（标量，广播到4个权重行）
+    //                 const float i_scale = input_scales[i * scale_per_k + k_scale_idx];
+    //                 float32x4_t v_i_scale = vdupq_n_f32(i_scale);
 
-                    // combined_scale[joff+0..3] = i_scale * w_scale[0..3]
-                    float32x4_t combined = vmulq_f32(v_i_scale, w_scale);
+    //                 // combined_scale[joff+0..3] = i_scale * w_scale[0..3]
+    //                 float32x4_t combined = vmulq_f32(v_i_scale, w_scale);
 
-                    // 从 NPU 输出加载4个 int32，转 float
-                    int32x4_t v_int32 = vld1q_s32(&task_output[feature_offset]);
-                    float32x4_t v_val  = vcvtq_f32_s32(v_int32);
+    //                 // 从 NPU 输出加载4个 int32，转 float
+    //                 int32x4_t v_int32 = vld1q_s32(&task_output[feature_offset]);
+    //                 float32x4_t v_val  = vcvtq_f32_s32(v_int32);
 
-                    // 乘以 combined_scale
-                    v_val = vmulq_f32(v_val, combined);
+    //                 // 乘以 combined_scale
+    //                 v_val = vmulq_f32(v_val, combined);
 
-                    // 累加到 dst_data（注意：第一段原始用 double 累加，
-                    // 这里改为 float 以支持 NEON；如需 double 精度请保留原始路径）
-                    float* out_ptr = &dst_data[i * M + cur_M_base];
-                    float32x4_t out_old = vld1q_f32(out_ptr);
-                    out_old = vaddq_f32(out_old, v_val);
-                    vst1q_f32(out_ptr, out_old);
+    //                 // 累加到 dst_data（注意：第一段原始用 double 累加，
+    //                 // 这里改为 float 以支持 NEON；如需 double 精度请保留原始路径）
+    //                 float* out_ptr = &dst_data[i * M + cur_M_base];
+    //                 float32x4_t out_old = vld1q_f32(out_ptr);
+    //                 out_old = vaddq_f32(out_old, v_val);
+    //                 vst1q_f32(out_ptr, out_old);
 
-                    feature_offset += 4;
-                }
-            }
-        }
+    //                 feature_offset += 4;
+    //             }
+    //         }
+    //     }
 
-        auto e_time = ggml_time_us();
-        cpu_total_time += (e_time - s_time);
+    //     auto e_time = ggml_time_us();
+    //     cpu_total_time += (e_time - s_time);
 
-        {
-            std::lock_guard<std::mutex> lock(npu_worker_mtx);
-            buffer_free[index].store(0, std::memory_order_release);
-            npu_cv.notify_one();
-        }
-        index = (index + 1) & 0x1;
-    }
+    //     {
+    //         std::lock_guard<std::mutex> lock(npu_worker_mtx);
+    //         buffer_free[index].store(0, std::memory_order_release);
+    //         npu_cv.notify_one();
+    //     }
+    //     index = (index + 1) & 0x1;
+    // }
+
+
     auto end_time3 = ggml_time_us();
     printf("[Debug] CPU处理完成: 耗时=%.2f ms\n", (end_time3 - end_time2) / 1000.0);
-    printf("[Debug] CPU总处理时间: %.2f ms\n", cpu_total_time / 1000.0);
-    printf("[Debug] CPU等待时间: %.2f ms\n", wait_total_time / 1000.0);
+    printf("[Debug] CPU总处理时间: %.2f ms\n", cpu_time / 1000.0);
+    printf("[Debug] CPU等待时间: %.2f ms\n", wait_time / 1000.0);
     // memcpy(src0->data, data_backup.data(), ggml_nbytes(src0));
     npu_tasks_shared.reset();
 }
