@@ -44,7 +44,7 @@ extern int g_npu_fd;
 #define DOMAIN_SIZE (4096UL * 1024 * 1024)
 #define REGCMD_SIZE (64 * 1024)  // 64KB for register commands
 #define TASKS_MEM_SIZE (4 * 1024)  // 4KB for task descriptors
-#define NPU_INPUT_BUFFER_SIZE (25 * 1024 * 1024)  // 50MB for input/output buffers
+#define NPU_INPUT_BUFFER_SIZE (50 * 1024 * 1024)  // 50MB for input/output buffers
 #define NPU_OUTPUT_BUFFER_SIZE (450 * 1024 * 1024)  // 50MB for output buffers
 
 

@@ -1569,43 +1569,97 @@ UseGgmlGemm2:;
         
         struct ggml_tensor* cur = src0;
         while (cur != NULL) {
-            // 1. 打印基础信息
-            printf("\n[DEBUG] Current Tensor: %-20s | Type: %d | Data: %p\n", 
-                cur->name, cur->type, cur->data);
+            // 1. 打印基础信息和 Op 名称
+            // 使用 ggml_op_name() 将枚举转为可读字符串
+            printf("\n[DEBUG] Tensor: %-20s | Op: %-12s | Type: %d | Data: %p\n", 
+                cur->name, ggml_op_name(cur->op), cur->type, cur->data);
 
-            // 2. 打印前 32 个元素 (仅限 FP32 类型且数据已分配)
+            // 2. 打印维度和步长 (对排查 view/permute 导致的地址偏移极其重要)
+            printf("  Shape: [%ld, %ld, %ld, %ld] | Strides: [%zu, %zu, %zu, %zu]\n",
+                cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                cur->nb[0], cur->nb[1], cur->nb[2], cur->nb[3]);
+
+            // 3. 打印前 32 个元素 (针对 FP32)
             if (cur->data != NULL) {
                 if (cur->type == GGML_TYPE_F32) {
                     float * data_ptr = (float *)cur->data;
                     printf("  Data (F32): ");
-                    for (int i = 0; i < 32; ++i) {
-                        // 防止溢出：如果 tensor 元素总数小于 32
-                        if (i < (int)ggml_nelements(cur)) {
-                            printf("%.4f ", data_ptr[i]);
-                        }
+                    int n_print = (int)ggml_nelements(cur) < 32 ? (int)ggml_nelements(cur) : 32;
+                    for (int i = 0; i < n_print; ++i) {
+                        printf("%.4f ", data_ptr[i]);
                     }
                     printf("\n");
                 } else {
-                    printf("  Data: [Non-F32 type, skipping data print]\n");
+                    // 如果是量化类型，打印前几个字节的十六进制，确认是否全 0
+                    uint8_t * u8_ptr = (uint8_t *)cur->data;
+                    printf("  Data (Hex): ");
+                    for (int i = 0; i < 16; i++) printf("%02x ", u8_ptr[i]);
+                    printf("...\n");
                 }
             } else {
                 printf("  Data: [NULL - Not yet allocated]\n");
             }
 
-            // 3. 沿链条向上追溯
+            // 4. 沿链条向上追溯 (增加路径说明)
             if (cur->view_src != NULL) {
-                printf("  -> Moving up View Chain to: %s\n", cur->view_src->name);
+                printf("  [VIEW] -> offset: %zu bytes | src: %s\n", cur->view_offs, cur->view_src->name);
                 cur = cur->view_src;
             } else if (cur->src[0] != NULL) {
-                printf("  -> Moving up Op Source (src[0]) to: %s\n", cur->src[0]->name);
+                printf("  [OP]   -> input[0]: %s\n", cur->src[0]->name);
                 cur = cur->src[0];
             } else {
-                printf("  -> Reached Root.\n");
+                printf("  [ROOT] -> Reached original weight.\n");
                 break;
             }
         }
         
         printf("  src1 (input):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", src1->name, (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3], src1->type);
+        cur = src1;
+        while (cur != NULL) {
+            // 1. 打印基础信息和 Op 名称
+            // 使用 ggml_op_name() 将枚举转为可读字符串
+            printf("\n[DEBUG] Tensor: %-20s | Op: %-12s | Type: %d | Data: %p\n", 
+                cur->name, ggml_op_name(cur->op), cur->type, cur->data);
+
+            // 2. 打印维度和步长 (对排查 view/permute 导致的地址偏移极其重要)
+            printf("  Shape: [%ld, %ld, %ld, %ld] | Strides: [%zu, %zu, %zu, %zu]\n",
+                cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                cur->nb[0], cur->nb[1], cur->nb[2], cur->nb[3]);
+
+            // 3. 打印前 32 个元素 (针对 FP32)
+            if (cur->data != NULL) {
+                if (cur->type == GGML_TYPE_F32) {
+                    float * data_ptr = (float *)cur->data;
+                    printf("  Data (F32): ");
+                    int n_print = (int)ggml_nelements(cur) < 32 ? (int)ggml_nelements(cur) : 32;
+                    for (int i = 0; i < n_print; ++i) {
+                        printf("%.4f ", data_ptr[i]);
+                    }
+                    printf("\n");
+                } else {
+                    // 如果是量化类型，打印前几个字节的十六进制，确认是否全 0
+                    uint8_t * u8_ptr = (uint8_t *)cur->data;
+                    printf("  Data (Hex): ");
+                    for (int i = 0; i < 16; i++) printf("%02x ", u8_ptr[i]);
+                    printf("...\n");
+                }
+            } else {
+                printf("  Data: [NULL - Not yet allocated]\n");
+            }
+
+            // 4. 沿链条向上追溯 (增加路径说明)
+            if (cur->view_src != NULL) {
+                printf("  [VIEW] -> offset: %zu bytes | src: %s\n", cur->view_offs, cur->view_src->name);
+                cur = cur->view_src;
+            } else if (cur->src[0] != NULL) {
+                printf("  [OP]   -> input[0]: %s\n", cur->src[0]->name);
+                cur = cur->src[0];
+            } else {
+                printf("  [ROOT] -> Reached original weight.\n");
+                break;
+            }
+        }
+        
         printf("  dst (output):  %s, shape=[%lld, %lld, %lld, %lld], type=%d\n", dst->name, (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3], dst->type);
         
         // 打印 src1 (input) 的前 64 个值 (FP32)
