@@ -195,6 +195,11 @@ void quantize_row_q5_1_ref(const float * GGML_RESTRICT x, block_q5_1 * GGML_REST
     }
 }
 
+
+void quantize_row_q8_0_512_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t k) {
+}
+
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK8_0 == 0);
@@ -397,6 +402,12 @@ void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRI
         }
     }
 }
+
+void dequantize_row_q8_0_512(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+
+}
+
+
 
 void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK8_0;

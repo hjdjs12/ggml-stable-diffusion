@@ -705,12 +705,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
     [GGML_TYPE_Q8_0_512] = {
-        .type_name                = "q8_0_256",
+        .type_name                = "q8_0_512",
         .blck_size                = 512,
         .type_size                = 514,
         .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_0_512,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_512_ref,
     },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",

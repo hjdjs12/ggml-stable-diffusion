@@ -2666,16 +2666,17 @@ void ggml_compute_forward_mul_mat_npu(
     int domain_id = weight_domain ? weight_domain->id : get_default_domain_id();
     auto start_time = std::chrono::high_resolution_clock::now();
     try {
-        // if(type == GGML_TYPE_Q8_0_512) {
-        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
-        //     input_type.store(1, std::memory_order_release);
-        //     compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
-        // }else{
-        //     std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
-        //     input_type.store(0, std::memory_order_release);
+        if(type == GGML_TYPE_Q8_0_512) {
+            std::cout << "ggml_compute_forward_mul_mat_npu: Using Q8_0 parallel path" << std::endl;
+            input_type.store(1, std::memory_order_release);
+            compute_matmul_q8_0_parallel(src0, src1, dst, domain_id);
+        }else{
+            std::cout << "ggml_compute_forward_mul_mat_npu: Using FP16 parallel path" << std::endl;
+            input_type.store(0, std::memory_order_release);
             // compute_matmul_fp16_parallel(src0, src1, dst, domain_id);
-        // }
-        compute_matmul_fp16_parallel_dynamic(src0, src1, dst, domain_id);
+            compute_matmul_fp16_parallel_dynamic(src0, src1, dst, domain_id);
+        }
+        // compute_matmul_fp16_parallel_dynamic(src0, src1, dst, domain_id);
     } catch (const std::exception& e) {
         fprintf(stderr, "[NPU] Error: %s, falling back to CPU\n", e.what());
         // Let GGML handle CPU fallback by not writing to dst
